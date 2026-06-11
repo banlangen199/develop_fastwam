@@ -11,6 +11,14 @@ evaluate_results/
 .deepspeed*
 
 
+# Vendored LIBERO benchmark (should live in its own repo)
+experiments/libero/libero/
+
+# LIBERO generated init files
+*.pruned_init
+*.bddl
+*.init
+
 # ai coding
 .codex/
 .claude/
