@@ -46,6 +46,7 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        self.freeze_video_expert = bool(cfg.get("freeze_video_expert", False))
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -81,11 +82,7 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        trainable_params = self._configure_trainable_parameters(self.model)
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -281,10 +278,14 @@ class Wan22Trainer:
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
         logger.info("Setting DiT to train mode and freezing other model components.")
         model = self.accelerator.unwrap_model(self.model)
-        self._apply_dit_only_train_mode(model)
+        self._configure_trainable_parameters(model)
 
-    @staticmethod
-    def _apply_dit_only_train_mode(model):
+    def _configure_trainable_parameters(self, model):
+        if hasattr(model, "configure_trainable_parameters"):
+            params = model.configure_trainable_parameters(freeze_video_expert=self.freeze_video_expert)
+            if not params:
+                raise ValueError("Model returned no trainable parameters.")
+            return params
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -293,6 +294,10 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        params = list(model.dit.parameters())
+        if proprio_encoder is not None:
+            params.extend(list(proprio_encoder.parameters()))
+        return params
 
     @staticmethod
     def _to_batched_eval_sample(sample):

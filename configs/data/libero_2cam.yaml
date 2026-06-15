@@ -34,6 +34,26 @@ train:
   is_training_set: true
   skip_padding_as_possible: false
   concat_multi_camera: "horizontal"
+  dream_target:
+    enabled: false
+    mode: fixed_offset
+    future_offset: 4
+    modalities: ["dyn", "depth", "dino", "sam"]
+    cameras: ["image", "wrist_image"]
+    extra_roots:
+      dyn: cotracker
+      depth: depth
+      dino: dinov2
+      sam: sam
+    array_keys:
+      depth: depth
+      dino: features
+      sam: features
+    token_specs:
+      dyn: {n: 8, dim: 1}
+      depth: {n: 8, dim: 1}
+      dino: {n: 8, dim: 768}
+      sam: {n: 8, dim: 256}
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}

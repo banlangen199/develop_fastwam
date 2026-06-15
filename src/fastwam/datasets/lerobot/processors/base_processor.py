@@ -235,6 +235,9 @@ class BaseProcessor(ABC):
         assert sample["proprio"].shape[-1] == self.proprio_output_dim
 
         sample["idx"] = data["idx"]
+        for key in ("dataset_index", "episode_index", "frame_index"):
+            if key in data:
+                sample[key] = data[key]
 
         sample = self.tokenizer(sample)
         

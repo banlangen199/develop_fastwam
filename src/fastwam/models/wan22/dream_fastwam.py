@@ -171,18 +171,116 @@ class DreamFastWAM(FastWAM):
         }
         return model
 
+    def freeze_video_expert(self):
+        self.video_expert.eval()
+        self.video_expert.requires_grad_(False)
+        logger.info("Frozen DreamFastWAM video expert parameters.")
+
+    def configure_trainable_parameters(self, freeze_video_expert: bool = False) -> list[torch.nn.Parameter]:
+        self.eval()
+        self.requires_grad_(False)
+        self.mot.train()
+        self.action_expert.train()
+        self.action_expert.requires_grad_(True)
+        self.dream_expert.train()
+        self.dream_expert.requires_grad_(True)
+        if freeze_video_expert:
+            self.freeze_video_expert()
+        else:
+            self.video_expert.train()
+            self.video_expert.requires_grad_(True)
+        if self.proprio_encoder is not None:
+            self.proprio_encoder.train()
+            self.proprio_encoder.requires_grad_(True)
+        params = [p for p in self.parameters() if p.requires_grad]
+        logger.info(
+            "DreamFastWAM trainable parameters: %.3fM (freeze_video_expert=%s)",
+            sum(p.numel() for p in params) / 1e6,
+            freeze_video_expert,
+        )
+        return params
+
+    def load_checkpoint(self, path, optimizer=None):
+        payload = torch.load(path, map_location="cpu")
+        if "mot" in payload:
+            current = self.mot.state_dict()
+            filtered = {}
+            skipped_shape = []
+            for key, value in payload["mot"].items():
+                if key not in current:
+                    filtered[key] = value
+                    continue
+                if tuple(current[key].shape) != tuple(value.shape):
+                    skipped_shape.append((key, tuple(value.shape), tuple(current[key].shape)))
+                    continue
+                filtered[key] = value
+            incompatible = self.mot.load_state_dict(filtered, strict=False)
+            missing = list(incompatible.missing_keys)
+            unexpected = list(incompatible.unexpected_keys)
+            logger.info("Loaded DreamFastWAM MoT checkpoint strict=False from %s", path)
+            logger.info("Checkpoint missing keys (%d): %s", len(missing), missing[:50])
+            logger.info("Checkpoint unexpected keys (%d): %s", len(unexpected), unexpected[:50])
+            if skipped_shape:
+                logger.warning(
+                    "Skipped checkpoint keys with incompatible shapes (%d). First keys: %s",
+                    len(skipped_shape),
+                    skipped_shape[:20],
+                )
+            bad_missing = [
+                k for k in missing
+                if not (k.startswith("mixtures.dream.") or ".dream_" in k or k.startswith("dream_"))
+            ]
+            if bad_missing:
+                logger.warning(
+                    "Checkpoint is missing non-dream MoT keys; verify FastWAM backbone loading. First keys: %s",
+                    bad_missing[:50],
+                )
+        elif "dit" in payload:
+            logger.warning("Loading legacy `dit` checkpoint into DreamFastWAM video expert only.")
+            current = self.video_expert.state_dict()
+            filtered = {}
+            skipped_shape = []
+            for key, value in payload["dit"].items():
+                if key in current and tuple(current[key].shape) != tuple(value.shape):
+                    skipped_shape.append((key, tuple(value.shape), tuple(current[key].shape)))
+                    continue
+                filtered[key] = value
+            incompatible = self.video_expert.load_state_dict(filtered, strict=False)
+            if incompatible.missing_keys:
+                logger.warning("Video expert missing keys from legacy checkpoint: %s", incompatible.missing_keys[:50])
+            if incompatible.unexpected_keys:
+                logger.warning("Video expert unexpected keys from legacy checkpoint: %s", incompatible.unexpected_keys[:50])
+            if skipped_shape:
+                logger.warning("Skipped legacy video keys with incompatible shapes: %s", skipped_shape[:20])
+        else:
+            raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
+
+        if self.proprio_encoder is not None:
+            if "proprio_encoder" in payload:
+                self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+            else:
+                logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
+        elif "proprio_encoder" in payload:
+            logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        if optimizer is not None and "optimizer" in payload:
+            optimizer.load_state_dict(payload["optimizer"])
+        return payload
+
     def build_inputs(self, sample, tiled: bool = False):
         if self.training and "dream_targets" not in sample:
             raise ValueError(
-                "DreamFastWAM training requires `sample['dream_targets']` with keys: "
-                "dyn, depth, dino, sam."
+                "DreamFastWAM training requires non-empty `sample['dream_targets']`. "
+                "Enable data.train.dream_target or use model=fastwam for ordinary FastWAM training."
             )
         inputs = super().build_inputs(sample, tiled=tiled)
         if "dream_targets" in sample:
             targets = sample["dream_targets"]
-            missing = {"dyn", "depth", "dino", "sam"} - set(targets.keys())
-            if missing:
-                raise ValueError(f"`sample['dream_targets']` missing keys: {sorted(missing)}")
+            if not targets:
+                raise ValueError("`sample['dream_targets']` is empty; at least one modality is required.")
+            unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam"}
+            if unknown:
+                raise ValueError(f"`sample['dream_targets']` contains unsupported keys: {sorted(unknown)}")
             inputs["dream_targets"] = {
                 key: value.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
                 for key, value in targets.items()
@@ -210,15 +308,24 @@ class DreamFastWAM(FastWAM):
             device=device,
         )
 
-        # dream -> video + same-modality dream
-        mask[dream_start:action_start, :video_seq_len] = True
+        current_frame_tokens = min(int(video_tokens_per_frame), int(video_seq_len))
+        if current_frame_tokens <= 0:
+            raise ValueError(
+                f"Cannot build DreamFastWAM attention mask with current_frame_tokens={current_frame_tokens}."
+            )
+
+        # Dream/action use only current-frame RGB video tokens during training and inference.
+        # This prevents dream supervision from peeking at noisy future video latents and keeps
+        # the train-time conditioning contract aligned with single-frame inference.
+        mask[dream_start:action_start, :current_frame_tokens] = True
         for slc in self.dream_expert.modality_slices().values():
             rows = slice(dream_start + slc.start, dream_start + slc.stop)
             cols = slice(dream_start + slc.start, dream_start + slc.stop)
             mask[rows, cols] = True
 
-        # action -> video + all dream + action
-        mask[action_start:, :action_start] = True
+        # action -> current-frame video + all dream + action
+        mask[action_start:, :current_frame_tokens] = True
+        mask[action_start:, dream_start:action_start] = True
         mask[action_start:, action_start:] = True
         return mask
 
@@ -241,27 +348,43 @@ class DreamFastWAM(FastWAM):
             "dino": (bsz, self.dream_expert.n_dino, self.dream_expert.dino_dim),
             "sam": (bsz, self.dream_expert.n_sam, self.dream_expert.sam_dim),
         }
+        if not targets:
+            raise ValueError("Dream loss received no target modalities.")
+        unknown = set(targets.keys()) - set(expected)
+        if unknown:
+            raise ValueError(f"Dream loss received unsupported target modalities: {sorted(unknown)}")
         for key, shape in expected.items():
+            if key not in targets:
+                continue
             self._validate_dream_target(key, targets[key], shape)
 
-        loss_dyn = F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float())
-        loss_depth = F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float())
-        loss_dino = 1.0 - F.cosine_similarity(
-            F.normalize(pred["dino"].float(), dim=-1),
-            F.normalize(targets["dino"].float(), dim=-1),
-            dim=-1,
-        ).mean()
-        loss_sam = 1.0 - F.cosine_similarity(
-            F.normalize(pred["sam"].float(), dim=-1),
-            F.normalize(targets["sam"].float(), dim=-1),
-            dim=-1,
-        ).mean()
-        loss_dream = (
-            self.loss_lambda_dyn * loss_dyn
-            + self.loss_lambda_depth * loss_depth
-            + self.loss_lambda_dino * loss_dino
-            + self.loss_lambda_sam * loss_sam
-        )
+        zero = pred["dyn"].sum() * 0.0
+        loss_dyn = zero
+        loss_depth = zero
+        loss_dino = zero
+        loss_sam = zero
+        loss_terms = []
+        if "dyn" in targets:
+            loss_dyn = F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float())
+            loss_terms.append(self.loss_lambda_dyn * loss_dyn)
+        if "depth" in targets:
+            loss_depth = F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float())
+            loss_terms.append(self.loss_lambda_depth * loss_depth)
+        if "dino" in targets:
+            loss_dino = 1.0 - F.cosine_similarity(
+                F.normalize(pred["dino"].float(), dim=-1),
+                F.normalize(targets["dino"].float(), dim=-1),
+                dim=-1,
+            ).mean()
+            loss_terms.append(self.loss_lambda_dino * loss_dino)
+        if "sam" in targets:
+            loss_sam = 1.0 - F.cosine_similarity(
+                F.normalize(pred["sam"].float(), dim=-1),
+                F.normalize(targets["sam"].float(), dim=-1),
+                dim=-1,
+            ).mean()
+            loss_terms.append(self.loss_lambda_sam * loss_sam)
+        loss_dream = sum(loss_terms)
         return loss_dream, {
             "loss_dyn": loss_dyn,
             "loss_depth": loss_depth,
@@ -280,8 +403,7 @@ class DreamFastWAM(FastWAM):
         image_is_pad = inputs["image_is_pad"]
         if "dream_targets" not in inputs:
             raise ValueError(
-                "DreamFastWAM training requires `sample['dream_targets']` with keys: "
-                "dyn, depth, dino, sam."
+                "DreamFastWAM training requires non-empty `sample['dream_targets']`."
             )
         dream_targets = inputs["dream_targets"]
 

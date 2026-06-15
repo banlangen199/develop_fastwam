@@ -1,0 +1,15 @@
+defaults:
+  - libero_2cam
+  - _self_
+
+train:
+  dataset_name: libero_object
+  dataset_dirs:
+    - ./data/libero_mujoco3.3.2/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+  pretrained_norm_stats: null
+  dream_target:
+    enabled: true
+    mode: fixed_offset
+    future_offset: 4
+    modalities: ["dyn", "depth", "dino", "sam"]
+
