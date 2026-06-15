@@ -6,6 +6,7 @@ import time
 import numpy as np
 import traceback
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as transforms_F
 from contextlib import contextmanager
 
@@ -64,6 +65,7 @@ class DreamTargetAdapter:
         self.feature_dims = dict(self.DEFAULT_FEATURE_DIMS)
         self.feature_dims.update(dict(cfg.get("feature_dims", {}) or {}))
         self.token_grids = dict(cfg.get("token_grids", {}) or {})
+        self.image_patch_size = int(cfg.get("image_patch_size", 16))
         self.target_shapes = {
             name: tuple(int(x) for x in shape)
             for name, shape in dict(cfg.get("target_shapes", {}) or {}).items()
@@ -120,8 +122,78 @@ class DreamTargetAdapter:
                 targets[modality] = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
             else:
                 targets[modality] = self._load_single_frame(ds_root, modality, episode_index, target_frame)
-            self._validate_target_shape(modality, targets[modality])
+            self._validate_target_shape(
+                modality=modality,
+                tensor=targets[modality],
+                ds_root=ds_root,
+                dataset_index=dataset_index,
+                episode_index=episode_index,
+                frame_index=frame_index,
+                target_frame=target_frame,
+            )
         return targets
+
+    def discover(self, sample) -> dict[str, dict]:
+        if not self.enabled:
+            raise ValueError("dream_target.enabled must be true for shape discovery.")
+        if "dataset_index" not in sample or "episode_index" not in sample or "frame_index" not in sample:
+            raise ValueError(
+                "dream_target requires dataset_index / episode_index / frame_index, "
+                "but they were not found after preprocessing"
+            )
+        dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
+        episode_index = int(torch.as_tensor(sample["episode_index"]).item())
+        frame_index = int(torch.as_tensor(sample["frame_index"]).item())
+        target_frame = frame_index + self.future_offset
+        ds_root = self.dataset_dirs[dataset_index]
+        report = {}
+        for modality in self.modalities:
+            if modality == "dyn":
+                per_cam = []
+                for camera in self.cameras:
+                    path = self._npz_path(ds_root, "dyn", camera, episode_index)
+                    with np.load(path) as payload:
+                        tracks = payload["tracks"]
+                        start_row = self._frame_row(payload, path, frame_index)
+                        target_row = self._frame_row(payload, path, target_frame)
+                        delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
+                        motion = delta.norm(dim=-1, keepdim=True)
+                        if "visibility" in payload.files:
+                            motion = motion * torch.as_tensor(payload["visibility"][target_row]).float().reshape(-1, 1)
+                        motion = (motion / motion.max().clamp(min=1e-6)).clamp(0.0, 1.0)
+                        per_cam.append((motion, str(path)))
+            else:
+                per_cam = [
+                    (
+                        self._load_npz_array(self._npz_path(ds_root, modality, camera, episode_index), modality, target_frame),
+                        str(self._npz_path(ds_root, modality, camera, episode_index)),
+                    )
+                    for camera in self.cameras
+                ]
+            final = self._concat_camera_targets(per_cam[0][0], per_cam[1][0], modality)
+            if modality == "depth":
+                concat_shape = list(self.concat_2cam_images_horiz(per_cam[0][0], per_cam[1][0], modality).shape)
+                layout = "token_feature"
+            elif modality == "dyn":
+                concat_shape = list(torch.cat(
+                    [self._dynamic_score_to_grid(per_cam[0][0]), self._dynamic_score_to_grid(per_cam[1][0])],
+                    dim=1,
+                ).shape)
+                layout = "token_feature"
+            elif modality in {"dino", "sam"}:
+                layout = self.modality_configs.get(modality, {}).get("target_layout", "grid_feature")
+                concat_shape = list(final.shape)
+            else:
+                layout = "token_feature"
+                concat_shape = list(final.shape)
+            report[modality] = {
+                "source_shape": [list(per_cam[0][0].shape), list(per_cam[1][0].shape)],
+                "after_horizontal_concat_shape": concat_shape,
+                "final_decoder_target_shape": list(final.shape),
+                "target_layout": layout,
+                "source_paths": [per_cam[0][1], per_cam[1][1]],
+            }
+        return report
 
     def _npz_path(self, ds_root: Path, modality: str, camera: str, episode_index: int) -> Path:
         modality_cfg = self.modality_configs.get(modality, {})
@@ -225,29 +297,90 @@ class DreamTargetAdapter:
                     )
         return self._concat_camera_targets(dyn_tensors[0], dyn_tensors[1], "dyn")
 
-    def _validate_target_shape(self, modality: str, tensor: torch.Tensor):
+    def _source_paths(self, ds_root: Path, modality: str, episode_index: int) -> list[str]:
+        return [
+            str(self._npz_path(ds_root, modality, camera, episode_index))
+            for camera in self.cameras
+        ]
+
+    def _validate_target_shape(
+        self,
+        *,
+        modality: str,
+        tensor: torch.Tensor,
+        ds_root: Path,
+        dataset_index: int,
+        episode_index: int,
+        frame_index: int,
+        target_frame: int,
+    ):
         expected = self.target_shapes.get(modality)
         if expected is None:
             return
         if tuple(tensor.shape) != expected:
             raise ValueError(
-                f"dream_targets[{modality!r}] shape mismatch in dataset adapter: "
-                f"expected {expected}, got {tuple(tensor.shape)}"
+                f"dream target shape mismatch for {modality}: expected {list(expected)} from config, "
+                f"got {list(tensor.shape)}. dataset={ds_root.name} dataset_index={dataset_index} "
+                f"episode={episode_index} frame={frame_index} target_frame={target_frame} "
+                f"cameras={self.cameras} source_paths={self._source_paths(ds_root, modality, episode_index)}. "
+                "Run discover_dream_target_shapes.py again or fix adapter."
             )
 
     def _concat_camera_targets(self, primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:
         if modality == "depth":
-            return self.concat_2cam_images_horiz(primary, wrist, modality)
+            image = self.concat_2cam_images_horiz(primary, wrist, modality)
+            patch_size = int(self.modality_configs.get("depth", {}).get("patch_size", self.image_patch_size))
+            return self._patchify_image_target(image, patch_size=patch_size, modality=modality)
         if modality == "dyn":
             primary_mask = self._dynamic_score_to_grid(primary)
             wrist_mask = self._dynamic_score_to_grid(wrist)
-            return torch.cat([primary_mask, wrist_mask], dim=1).contiguous()
+            dyn_map = torch.cat([primary_mask, wrist_mask], dim=1).contiguous()
+            patch_size = int(self.modality_configs.get("dyn", {}).get("patch_size", self.image_patch_size))
+            return self._patch_pool_dynamic_score(dyn_map, patch_size=patch_size)
         if modality in {"dino", "sam"}:
             primary_tokens = self._as_token_matrix(primary, modality)
             wrist_tokens = self._as_token_matrix(wrist, modality)
             grid_h, grid_w = self._infer_token_grid(modality, primary_tokens.shape[0])
             return self.concat_2cam_tokens_horiz(primary_tokens, wrist_tokens, grid_h, grid_w)
         raise ValueError(f"Unsupported dream modality={modality!r}")
+
+    @staticmethod
+    def _patchify_image_target(image: torch.Tensor, patch_size: int, modality: str) -> torch.Tensor:
+        if patch_size <= 0:
+            raise ValueError(f"{modality}.patch_size must be positive, got {patch_size}.")
+        image = image.float()
+        if image.ndim == 2:
+            image = image.unsqueeze(0)
+        elif image.ndim == 3 and image.shape[0] >= 1:
+            pass
+        else:
+            raise ValueError(f"{modality} image target must be [H,W] or [C,H,W], got {tuple(image.shape)}.")
+        c, h, w = image.shape
+        if h % patch_size != 0 or w % patch_size != 0:
+            raise ValueError(
+                f"{modality} image target H/W must be divisible by patch_size={patch_size}, got C,H,W={tuple(image.shape)}."
+            )
+        patches = F.unfold(image.unsqueeze(0), kernel_size=patch_size, stride=patch_size)
+        return patches.squeeze(0).transpose(0, 1).contiguous()
+
+    @staticmethod
+    def _patch_pool_dynamic_score(score_map: torch.Tensor, patch_size: int) -> torch.Tensor:
+        if patch_size <= 0:
+            raise ValueError(f"dyn.patch_size must be positive, got {patch_size}.")
+        score_map = score_map.float().clamp(0.0, 1.0)
+        if score_map.ndim != 2:
+            raise ValueError(f"dyn score map must be [H,W] before patch pooling, got {tuple(score_map.shape)}.")
+        h, w = score_map.shape
+        if h % patch_size != 0 or w % patch_size != 0:
+            raise ValueError(
+                f"dyn score map H/W must be divisible by patch_size={patch_size}, got H,W={tuple(score_map.shape)}."
+            )
+        pooled = F.avg_pool2d(
+            score_map.unsqueeze(0).unsqueeze(0),
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        return pooled.flatten(2).transpose(1, 2).squeeze(0).contiguous()
 
     @staticmethod
     def concat_2cam_images_horiz(primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:
@@ -442,9 +575,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         sample = self[idx]
         if "dream_targets" not in sample:
             raise ValueError("Sample does not contain dream_targets; check dream_target configuration.")
-        shapes = {key: list(value.shape) for key, value in sample["dream_targets"].items()}
-        print("dream_target_shapes", shapes)
-        return shapes
+        report = self.dream_target_adapter.discover(sample)
+        for modality, item in report.items():
+            print(
+                f"{modality}: source={item['source_shape']} "
+                f"concat={item['after_horizontal_concat_shape']} "
+                f"final={item['final_decoder_target_shape']} "
+                f"target_layout={item['target_layout']}"
+            )
+        return report
 
     def _get(self, idx):
         sample_idx = idx

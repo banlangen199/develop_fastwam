@@ -60,6 +60,17 @@ class DreamFastWAM(FastWAM):
             counts["action_expert"] / 1e6,
             counts["total"] / 1e6,
         )
+        target_m = getattr(dream_expert, "target_num_params_m", None)
+        if target_m is not None:
+            target_m = float(target_m)
+            actual_m = counts["dream_expert"] / 1e6
+            logger.info("Dream expert params: %.1fM, target: %.1fM", actual_m, target_m)
+            if target_m > 0 and abs(actual_m - target_m) / target_m > 0.15:
+                logger.warning(
+                    "Dream expert parameter count differs from target by more than 15%%: actual=%.1fM target=%.1fM",
+                    actual_m,
+                    target_m,
+                )
         return counts
 
     @classmethod
@@ -356,22 +367,34 @@ class DreamFastWAM(FastWAM):
         loss_sam = zero
         loss_terms = []
         if "dyn" in targets:
+            dyn_min = float(targets["dyn"].detach().amin().item())
+            dyn_max = float(targets["dyn"].detach().amax().item())
+            if dyn_min < -1e-4 or dyn_max > 1.0 + 1e-4:
+                logger.warning(
+                    "Dream dyn target should be in [0, 1], got min=%.6f max=%.6f",
+                    dyn_min,
+                    dyn_max,
+                )
             loss_dyn = F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float())
             loss_terms.append(self.loss_lambda_dyn * loss_dyn)
         if "depth" in targets:
             loss_depth = F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float())
             loss_terms.append(self.loss_lambda_depth * loss_depth)
         if "dino" in targets:
+            pred_dino = self._flatten_feature_target(pred["dino"], "dino")
+            target_dino = self._flatten_feature_target(targets["dino"], "dino")
             loss_dino = 1.0 - F.cosine_similarity(
-                F.normalize(pred["dino"].float(), dim=-1),
-                F.normalize(targets["dino"].float(), dim=-1),
+                F.normalize(pred_dino.float(), dim=-1),
+                F.normalize(target_dino.float(), dim=-1),
                 dim=-1,
             ).mean()
             loss_terms.append(self.loss_lambda_dino * loss_dino)
         if "sam" in targets:
+            pred_sam = self._flatten_feature_target(pred["sam"], "sam")
+            target_sam = self._flatten_feature_target(targets["sam"], "sam")
             loss_sam = 1.0 - F.cosine_similarity(
-                F.normalize(pred["sam"].float(), dim=-1),
-                F.normalize(targets["sam"].float(), dim=-1),
+                F.normalize(pred_sam.float(), dim=-1),
+                F.normalize(target_sam.float(), dim=-1),
                 dim=-1,
             ).mean()
             loss_terms.append(self.loss_lambda_sam * loss_sam)
@@ -382,6 +405,15 @@ class DreamFastWAM(FastWAM):
             "loss_dino": loss_dino,
             "loss_sam": loss_sam,
         }
+
+    @staticmethod
+    def _flatten_feature_target(tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if tensor.ndim == 3:
+            return tensor
+        if tensor.ndim == 4:
+            bsz, h, w, dim = tensor.shape
+            return tensor.reshape(bsz, h * w, dim)
+        raise ValueError(f"{name} dream target must be [B,N,C] or [B,H,W,C], got {tuple(tensor.shape)}")
 
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)

@@ -19,6 +19,7 @@ class DenseDreamDecoder(nn.Module):
         modality: str,
         latent_dim: int,
         target_shape: list[int] | tuple[int, ...],
+        target_layout: str = "token_feature",
         decoder_dim: int,
         num_layers: int,
         num_heads: int,
@@ -29,28 +30,48 @@ class DenseDreamDecoder(nn.Module):
         self.modality = modality
         self.enabled = bool(enabled)
         self.type = type
+        self.target_layout = str(target_layout)
         if not self.enabled:
             self.target_shape = None
             return
         if target_shape is None:
             raise ValueError(
-                f"dream_decoder.{modality}.target_shape is required. "
-                "Run `python scripts/discover_dream_target_shapes.py --write-config ...` first."
+                f"dream_decoder.{modality}.target_shape is null. "
+                "Run scripts/discover_dream_target_shapes.py --write-config first."
             )
         self.target_shape = tuple(int(x) for x in target_shape)
         if len(self.target_shape) == 0 or any(x <= 0 for x in self.target_shape):
             raise ValueError(f"Invalid dream_decoder.{modality}.target_shape={target_shape}")
 
-        if modality in {"dino", "sam"}:
-            if len(self.target_shape) < 2:
-                raise ValueError(f"{modality} target_shape must include a feature dimension, got {target_shape}")
+        if self.target_layout == "token_feature":
+            if len(self.target_shape) != 2:
+                raise ValueError(
+                    f"dream_decoder.{modality}.target_layout=token_feature requires "
+                    f"target_shape=[num_tokens, feature_dim], got {target_shape}."
+                )
+            self.num_output_tokens = int(self.target_shape[0])
+            self.feature_dim = int(self.target_shape[1])
+            self.output_grid_shape = None
+        elif self.target_layout == "grid_feature":
+            if len(self.target_shape) != 3:
+                raise ValueError(
+                    f"dream_decoder.{modality}.target_layout=grid_feature requires "
+                    f"target_shape=[grid_h, grid_w, feature_dim], got {target_shape}."
+                )
+            grid_h, grid_w = int(self.target_shape[0]), int(self.target_shape[1])
+            self.num_output_tokens = grid_h * grid_w
             self.feature_dim = int(self.target_shape[-1])
-            self.num_output_tokens = int(reduce(mul, self.target_shape[:-1], 1))
             self.output_grid_shape = self.target_shape[:-1]
+        elif self.target_layout == "image":
+            raise ValueError(
+                f"dream_decoder.{modality}.target_layout=image is not supported in the first version. "
+                "Patchify image-like targets in the dataset and use token_feature."
+            )
         else:
-            self.feature_dim = 1
-            self.num_output_tokens = int(reduce(mul, self.target_shape, 1))
-            self.output_grid_shape = self.target_shape
+            raise ValueError(
+                f"Unsupported dream_decoder.{modality}.target_layout={self.target_layout!r}; "
+                "expected token_feature or grid_feature."
+            )
 
         self.latent_proj = nn.Linear(int(latent_dim), int(decoder_dim))
         self.output_queries = nn.Parameter(
@@ -79,9 +100,9 @@ class DenseDreamDecoder(nn.Module):
         )
         decoded = self.decoder(tgt=queries, memory=memory)
         out = self.output_proj(decoded)
-        if self.feature_dim == 1:
-            return out.squeeze(-1).reshape(latent_tokens.shape[0], *self.target_shape)
-        return out.reshape(latent_tokens.shape[0], *self.target_shape)
+        if self.target_layout == "grid_feature":
+            return out.reshape(latent_tokens.shape[0], *self.target_shape)
+        return out
 
 
 class DreamQueryExpert(nn.Module):
@@ -164,6 +185,7 @@ class DreamQueryExpert(nn.Module):
                 modality=modality,
                 latent_dim=self.hidden_dim,
                 target_shape=cfg.get("target_shape"),
+                target_layout=cfg.get("target_layout", "token_feature"),
                 decoder_dim=decoder_dim,
                 num_layers=decoder_layers,
                 num_heads=decoder_heads,

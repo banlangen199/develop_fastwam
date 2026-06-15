@@ -70,19 +70,28 @@ dream_query_config:
     decoder_dim: 384
     num_layers: 2
     num_heads: 24
+    image_patch_size: 16
     depth:
       enabled: true
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 16
       target_shape: [128, 256]
     dino:
       enabled: true
+      target_layout: grid_feature
       target_shape: [16, 32, 768]
     sam:
       enabled: true
+      target_layout: grid_feature
       target_shape: [16, 32, 256]
     dyn:
       enabled: true
       type: dynamic_mask
-      target_shape: [28, 56]
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 4
+      target_shape: [98, 1]
 
 video_scheduler:
   train_shift: 5.0

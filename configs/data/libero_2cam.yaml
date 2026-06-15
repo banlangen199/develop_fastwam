@@ -49,6 +49,7 @@ train:
       depth: depth
       dino: features
       sam: features
+    image_patch_size: 16
     feature_dims:
       dino: 768
       sam: 256
@@ -57,14 +58,26 @@ train:
       dino: [16, 16]
       sam: [16, 16]
     target_shapes:
-      dyn: [28, 56]
+      dyn: [98, 1]
       depth: [128, 256]
       dino: [16, 32, 768]
       sam: [16, 32, 256]
+    dyn:
+      type: dynamic_mask
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 4
     depth:
       source: depth_anything
       root: ./data/dream_modalities/depth_anything
       model: depth_anything_v2
+      target_layout: token_feature
+      source_layout: image
+      patch_size: 16
+    dino:
+      target_layout: grid_feature
+    sam:
+      target_layout: grid_feature
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
