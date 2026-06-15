@@ -6,7 +6,6 @@ import time
 import numpy as np
 import traceback
 import torch
-import torch.nn.functional as F
 import torchvision.transforms.functional as transforms_F
 from contextlib import contextmanager
 
@@ -26,14 +25,9 @@ DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the fo
 
 
 class DreamTargetAdapter:
-    """Loads fixed-offset dream targets and converts them to [n_token, dim]."""
+    """Loads fixed-offset dense dream targets with LIBERO 2-camera horizontal concat."""
 
-    DEFAULT_TOKEN_SPECS = {
-        "dyn": {"n": 8, "dim": 1},
-        "depth": {"n": 8, "dim": 1},
-        "dino": {"n": 8, "dim": 768},
-        "sam": {"n": 8, "dim": 256},
-    }
+    MODALITIES = {"dyn", "depth", "dino", "sam"}
     DEFAULT_EXTRA_ROOTS = {
         "dyn": "cotracker",
         "depth": "depth_anything_v3_metric",
@@ -45,6 +39,10 @@ class DreamTargetAdapter:
         "dino": "features",
         "sam": "features",
     }
+    DEFAULT_FEATURE_DIMS = {
+        "dino": 768,
+        "sam": 256,
+    }
 
     def __init__(self, dataset_dirs, cfg):
         if isinstance(cfg, DictConfig):
@@ -54,10 +52,7 @@ class DreamTargetAdapter:
         self.mode = str(cfg.get("mode", "fixed_offset"))
         self.future_offset = int(cfg.get("future_offset", 4))
         self.modalities = list(cfg.get("modalities", ["dyn", "depth", "dino", "sam"]))
-        self.modality_configs = {
-            name: dict(cfg.get(name, {}) or {})
-            for name in self.DEFAULT_TOKEN_SPECS
-        }
+        self.modality_configs = {name: dict(cfg.get(name, {}) or {}) for name in self.MODALITIES}
         cameras = cfg.get("cameras", cfg.get("camera", ["image", "wrist_image"]))
         if isinstance(cameras, str):
             cameras = [cameras]
@@ -66,11 +61,14 @@ class DreamTargetAdapter:
         self.array_keys.update(dict(cfg.get("array_keys", {}) or {}))
         self.extra_roots = dict(self.DEFAULT_EXTRA_ROOTS)
         self.extra_roots.update(dict(cfg.get("extra_roots", {}) or {}))
-        self.token_specs = {k: dict(v) for k, v in self.DEFAULT_TOKEN_SPECS.items()}
-        for name, spec in dict(cfg.get("token_specs", {}) or {}).items():
-            merged = dict(self.token_specs.get(name, {}))
-            merged.update(dict(spec))
-            self.token_specs[name] = merged
+        self.feature_dims = dict(self.DEFAULT_FEATURE_DIMS)
+        self.feature_dims.update(dict(cfg.get("feature_dims", {}) or {}))
+        self.token_grids = dict(cfg.get("token_grids", {}) or {})
+        self.target_shapes = {
+            name: tuple(int(x) for x in shape)
+            for name, shape in dict(cfg.get("target_shapes", {}) or {}).items()
+            if shape is not None
+        }
         self.dataset_dirs = [Path(p) for p in dataset_dirs]
 
         if self.enabled:
@@ -78,7 +76,7 @@ class DreamTargetAdapter:
                 raise ValueError(f"Unsupported dream_target.mode={self.mode!r}; only 'fixed_offset' is implemented.")
             if self.future_offset <= 0:
                 raise ValueError(f"dream_target.future_offset must be > 0, got {self.future_offset}")
-            unknown = set(self.modalities) - set(self.DEFAULT_TOKEN_SPECS)
+            unknown = set(self.modalities) - self.MODALITIES
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
             if "depth" in self.modalities:
@@ -88,6 +86,10 @@ class DreamTargetAdapter:
                         "dream_target depth supervision must use Depth Anything: set "
                         "dream_target.depth.source=depth_anything and dream_target.depth.root."
                     )
+            if len(self.cameras) != 2:
+                raise ValueError(
+                    f"Dream target horizontal concat expects exactly 2 cameras, got {self.cameras}."
+                )
 
     def has_enough_future(self, sample) -> bool:
         if not self.enabled:
@@ -118,6 +120,7 @@ class DreamTargetAdapter:
                 targets[modality] = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
             else:
                 targets[modality] = self._load_single_frame(ds_root, modality, episode_index, target_frame)
+            self._validate_target_shape(modality, targets[modality])
         return targets
 
     def _npz_path(self, ds_root: Path, modality: str, camera: str, episode_index: int) -> Path:
@@ -177,7 +180,7 @@ class DreamTargetAdapter:
             self._load_npz_array(self._npz_path(ds_root, modality, camera, episode_index), modality, target_frame)
             for camera in self.cameras
         ]
-        return self._to_token_matrix(self._concat_camera_targets(tensors, modality), modality)
+        return self._concat_camera_targets(tensors[0], tensors[1], modality)
 
     def _load_dyn(self, ds_root: Path, episode_index: int, frame_index: int, target_frame: int) -> torch.Tensor:
         dyn_tensors = []
@@ -204,6 +207,8 @@ class DreamTargetAdapter:
                     if "visibility" in payload.files:
                         vis = torch.as_tensor(payload["visibility"][target_row]).float().reshape(-1, 1)
                         motion = motion * vis
+                    max_motion = motion.max().clamp(min=1e-6)
+                    motion = (motion / max_motion).clamp(0.0, 1.0)
                     dyn_tensors.append(motion)
                 elif "dyn" in payload.files:
                     arr = payload["dyn"]
@@ -218,58 +223,115 @@ class DreamTargetAdapter:
                         f"{path} must contain CoTracker keys 'tracks'/'visibility' or dense key 'dyn' "
                         "for t->t+future_offset labels."
                     )
-        return self._to_token_matrix(self._concat_camera_targets(dyn_tensors, "dyn"), "dyn")
+        return self._concat_camera_targets(dyn_tensors[0], dyn_tensors[1], "dyn")
 
-    def _concat_camera_targets(self, tensors: list[torch.Tensor], modality: str) -> torch.Tensor:
-        if not tensors:
-            raise ValueError(f"No camera tensors loaded for dream modality={modality!r}.")
-        dim = int(self.token_specs[modality]["dim"])
-        if dim == 1:
-            return torch.cat([t.reshape(-1, 1) for t in tensors], dim=0)
-        rows = []
-        for tensor in tensors:
-            if tensor.ndim == 1 and tensor.numel() % dim == 0:
-                rows.append(tensor.reshape(-1, dim))
-            elif tensor.shape[-1] == dim:
-                rows.append(tensor.reshape(-1, dim))
-            else:
-                rows.append(tensor)
-        return torch.cat(rows, dim=0)
-
-    def _to_token_matrix(self, tensor: torch.Tensor, modality: str) -> torch.Tensor:
-        spec = self.token_specs[modality]
-        n_token = int(spec["n"])
-        dim = int(spec["dim"])
-        if tensor.ndim == 0:
-            tensor = tensor.reshape(1, 1)
-        elif tensor.ndim == 1:
-            if tensor.numel() == dim:
-                tensor = tensor.reshape(1, dim).expand(n_token, dim)
-            elif dim > 1 and tensor.numel() % dim == 0:
-                tensor = tensor.reshape(-1, dim)
-            else:
-                tensor = tensor.reshape(-1, 1)
-        elif tensor.ndim == 2 and tensor.shape[-1] == dim:
-            pass
-        else:
-            if dim == 1:
-                flat = tensor.reshape(1, 1, -1)
-                tensor = F.adaptive_avg_pool1d(flat, n_token).reshape(n_token, 1)
-            elif tensor.shape[-1] == dim:
-                tensor = tensor.reshape(-1, dim)
-            else:
-                raise ValueError(
-                    f"Cannot convert dream target modality={modality!r} from shape {tuple(tensor.shape)} "
-                    f"to [{n_token}, {dim}]. Add an explicit adapter or precompute [{n_token}, {dim}] features."
-                )
-        if tensor.shape[0] != n_token:
-            tensor = F.adaptive_avg_pool1d(tensor.transpose(0, 1).unsqueeze(0), n_token).squeeze(0).transpose(0, 1)
-        if tuple(tensor.shape) != (n_token, dim):
+    def _validate_target_shape(self, modality: str, tensor: torch.Tensor):
+        expected = self.target_shapes.get(modality)
+        if expected is None:
+            return
+        if tuple(tensor.shape) != expected:
             raise ValueError(
-                f"Dream target modality={modality!r} shape mismatch after adapter: "
-                f"expected ({n_token}, {dim}), got {tuple(tensor.shape)}"
+                f"dream_targets[{modality!r}] shape mismatch in dataset adapter: "
+                f"expected {expected}, got {tuple(tensor.shape)}"
             )
-        return tensor.contiguous()
+
+    def _concat_camera_targets(self, primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:
+        if modality == "depth":
+            return self.concat_2cam_images_horiz(primary, wrist, modality)
+        if modality == "dyn":
+            primary_mask = self._dynamic_score_to_grid(primary)
+            wrist_mask = self._dynamic_score_to_grid(wrist)
+            return torch.cat([primary_mask, wrist_mask], dim=1).contiguous()
+        if modality in {"dino", "sam"}:
+            primary_tokens = self._as_token_matrix(primary, modality)
+            wrist_tokens = self._as_token_matrix(wrist, modality)
+            grid_h, grid_w = self._infer_token_grid(modality, primary_tokens.shape[0])
+            return self.concat_2cam_tokens_horiz(primary_tokens, wrist_tokens, grid_h, grid_w)
+        raise ValueError(f"Unsupported dream modality={modality!r}")
+
+    @staticmethod
+    def concat_2cam_images_horiz(primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:
+        primary = primary.float()
+        wrist = wrist.float()
+        if primary.ndim == 3 and primary.shape[0] == 1:
+            primary = primary.squeeze(0)
+        if wrist.ndim == 3 and wrist.shape[0] == 1:
+            wrist = wrist.squeeze(0)
+        if primary.ndim != 2 or wrist.ndim != 2:
+            raise ValueError(
+                f"{modality} image-like targets must be [H,W] or [1,H,W], got "
+                f"{tuple(primary.shape)} and {tuple(wrist.shape)}"
+            )
+        if primary.shape[0] != wrist.shape[0]:
+            raise ValueError(
+                f"{modality} camera target height mismatch: {tuple(primary.shape)} vs {tuple(wrist.shape)}"
+            )
+        return torch.cat([primary, wrist], dim=1).contiguous()
+
+    @staticmethod
+    def concat_2cam_tokens_horiz(primary: torch.Tensor, wrist: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+        if primary.ndim != 2 or wrist.ndim != 2:
+            raise ValueError(
+                f"Token targets must be [N,C], got {tuple(primary.shape)} and {tuple(wrist.shape)}"
+            )
+        if primary.shape != wrist.shape:
+            raise ValueError(f"Token camera target shape mismatch: {tuple(primary.shape)} vs {tuple(wrist.shape)}")
+        if primary.shape[0] != grid_h * grid_w:
+            raise ValueError(
+                f"Token grid {grid_h}x{grid_w} does not match token count {primary.shape[0]}"
+            )
+        c = primary.shape[1]
+        primary_grid = primary.reshape(grid_h, grid_w, c)
+        wrist_grid = wrist.reshape(grid_h, grid_w, c)
+        return torch.cat([primary_grid, wrist_grid], dim=1).contiguous()
+
+    def _as_token_matrix(self, tensor: torch.Tensor, modality: str) -> torch.Tensor:
+        tensor = tensor.float()
+        feature_dim = int(self.feature_dims[modality])
+        if tensor.ndim == 1:
+            if tensor.numel() % feature_dim != 0:
+                raise ValueError(
+                    f"{modality} flat target length {tensor.numel()} is not divisible by feature_dim={feature_dim}."
+                )
+            return tensor.reshape(-1, feature_dim)
+        if tensor.ndim == 2:
+            if tensor.shape[-1] == feature_dim:
+                return tensor
+            if tensor.numel() % feature_dim == 0:
+                return tensor.reshape(-1, feature_dim)
+        if tensor.ndim >= 3 and tensor.shape[-1] == feature_dim:
+            return tensor.reshape(-1, feature_dim)
+        raise ValueError(
+            f"Cannot convert {modality} target shape {tuple(tensor.shape)} to [N,{feature_dim}]."
+        )
+
+    def _dynamic_score_to_grid(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.float()
+        if tensor.ndim == 2 and tensor.shape[-1] == 1:
+            tensor = tensor.squeeze(-1)
+        if tensor.ndim == 1:
+            grid_h, grid_w = self._infer_token_grid("dyn", tensor.numel())
+            return tensor.reshape(grid_h, grid_w).clamp(0.0, 1.0)
+        if tensor.ndim == 2:
+            return tensor.clamp(0.0, 1.0)
+        raise ValueError(f"Cannot convert dyn target shape {tuple(tensor.shape)} to dynamic mask grid.")
+
+    def _infer_token_grid(self, modality: str, num_tokens: int) -> tuple[int, int]:
+        configured = self.token_grids.get(modality)
+        if configured is not None:
+            grid_h, grid_w = int(configured[0]), int(configured[1])
+            if grid_h * grid_w != int(num_tokens):
+                raise ValueError(
+                    f"dream_target.token_grids.{modality}={configured} does not match token count {num_tokens}."
+                )
+            return grid_h, grid_w
+        side = int(round(float(num_tokens) ** 0.5))
+        if side * side == int(num_tokens):
+            return side, side
+        raise ValueError(
+            f"Cannot infer 2D grid for {modality} with {num_tokens} tokens. "
+            f"Set dream_target.token_grids.{modality}: [grid_h, grid_w]."
+        )
 
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
@@ -373,6 +435,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if "dream_targets" in sample:
             print("dream_targets", {k: tuple(v.shape) for k, v in sample["dream_targets"].items()})
         return sample
+
+    def discover_dream_target_shapes(self, idx: int = 0):
+        if not self.dream_target_adapter.enabled:
+            raise ValueError("dream_target.enabled must be true for shape discovery.")
+        sample = self[idx]
+        if "dream_targets" not in sample:
+            raise ValueError("Sample does not contain dream_targets; check dream_target configuration.")
+        shapes = {key: list(value.shape) for key, value in sample["dream_targets"].items()}
+        print("dream_target_shapes", shapes)
+        return shapes
 
     def _get(self, idx):
         sample_idx = idx

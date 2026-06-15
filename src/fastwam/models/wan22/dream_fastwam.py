@@ -329,36 +329,27 @@ class DreamFastWAM(FastWAM):
         mask[action_start:, action_start:] = True
         return mask
 
-    def _validate_dream_target(self, name: str, target: torch.Tensor, expected_shape: tuple[int, int, int]):
-        if tuple(target.shape) != expected_shape:
-            raise ValueError(
-                f"`sample['dream_targets']['{name}']` shape mismatch: "
-                f"expected {expected_shape}, got {tuple(target.shape)}."
-            )
-
     def _compute_dream_loss(
         self,
         pred: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        bsz = pred["dyn"].shape[0]
-        expected = {
-            "dyn": (bsz, self.dream_expert.n_dyn, self.dream_expert.dyn_dim),
-            "depth": (bsz, self.dream_expert.n_depth, self.dream_expert.depth_dim),
-            "dino": (bsz, self.dream_expert.n_dino, self.dream_expert.dino_dim),
-            "sam": (bsz, self.dream_expert.n_sam, self.dream_expert.sam_dim),
-        }
         if not targets:
             raise ValueError("Dream loss received no target modalities.")
-        unknown = set(targets.keys()) - set(expected)
+        unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam"}
         if unknown:
             raise ValueError(f"Dream loss received unsupported target modalities: {sorted(unknown)}")
-        for key, shape in expected.items():
-            if key not in targets:
-                continue
-            self._validate_dream_target(key, targets[key], shape)
+        for key, target in targets.items():
+            if key not in pred:
+                raise ValueError(f"Dream decoder did not produce modality={key!r}; available={sorted(pred.keys())}")
+            if tuple(pred[key].shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Dream prediction/target shape mismatch for {key}: "
+                    f"pred={tuple(pred[key].shape)} target={tuple(target.shape)}"
+                )
 
-        zero = pred["dyn"].sum() * 0.0
+        first_pred = next(iter(pred.values()))
+        zero = first_pred.sum() * 0.0
         loss_dyn = zero
         loss_depth = zero
         loss_dino = zero

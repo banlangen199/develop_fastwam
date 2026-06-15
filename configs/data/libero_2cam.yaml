@@ -49,11 +49,22 @@ train:
       depth: depth
       dino: features
       sam: features
-    token_specs:
-      dyn: {n: 8, dim: 1}
-      depth: {n: 8, dim: 1}
-      dino: {n: 8, dim: 768}
-      sam: {n: 8, dim: 256}
+    feature_dims:
+      dino: 768
+      sam: 256
+    token_grids:
+      dyn: [28, 28]
+      dino: [16, 16]
+      sam: [16, 16]
+    target_shapes:
+      dyn: [28, 56]
+      depth: [128, 256]
+      dino: [16, 32, 768]
+      sam: [16, 32, 256]
+    depth:
+      source: depth_anything
+      root: ./data/dream_modalities/depth_anything
+      model: depth_anything_v2
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}

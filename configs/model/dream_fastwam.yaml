@@ -45,24 +45,44 @@ action_dit_config:
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
 
 dream_query_config:
-  hidden_dim: 256
-  ffn_dim: 1024
   text_dim: 4096
   freq_dim: 256
   eps: 1.0e-6
   num_heads: 24
   attn_head_dim: 128
-  num_layers: 30
-  n_dyn: 8
-  n_depth: 8
-  n_dino: 8
-  n_sam: 8
-  dyn_dim: 1
-  depth_dim: 1
-  dino_dim: 768
-  sam_dim: 256
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   share_blocks: false
+
+  dream_query:
+    n_dyn: 8
+    n_depth: 8
+    n_dino: 8
+    n_sam: 8
+
+  dream_expert:
+    target_num_params_m: 200
+    hidden_dim: 384
+    num_layers: 30
+    num_heads: 24
+    mlp_ratio: 4.0
+
+  dream_decoder:
+    decoder_dim: 384
+    num_layers: 2
+    num_heads: 24
+    depth:
+      enabled: true
+      target_shape: [128, 256]
+    dino:
+      enabled: true
+      target_shape: [16, 32, 768]
+    sam:
+      enabled: true
+      target_shape: [16, 32, 256]
+    dyn:
+      enabled: true
+      type: dynamic_mask
+      target_shape: [28, 56]
 
 video_scheduler:
   train_shift: 5.0
