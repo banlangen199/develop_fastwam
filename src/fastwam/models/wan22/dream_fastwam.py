@@ -61,9 +61,12 @@ class DreamFastWAM(FastWAM):
             counts["total"] / 1e6,
         )
         target_m = getattr(dream_expert, "target_num_params_m", None)
+        actual_m = counts["dream_expert"] / 1e6
+        if hasattr(dream_expert, "architecture"):
+            dream_expert.architecture["dream_expert"]["actual_num_params_m"] = actual_m
+        cls._log_dream_architecture(dream_expert, actual_m)
         if target_m is not None:
             target_m = float(target_m)
-            actual_m = counts["dream_expert"] / 1e6
             logger.info("Dream expert params: %.1fM, target: %.1fM", actual_m, target_m)
             if target_m > 0 and abs(actual_m - target_m) / target_m > 0.15:
                 logger.warning(
@@ -72,6 +75,44 @@ class DreamFastWAM(FastWAM):
                     target_m,
                 )
         return counts
+
+    @classmethod
+    def _log_dream_architecture(cls, dream_expert, actual_num_params_m: float):
+        if not hasattr(dream_expert, "resolved_architecture"):
+            return
+        arch = dream_expert.resolved_architecture()
+        expert = arch["dream_expert"]
+        decoder = arch["dream_decoder"]
+        logger.info(
+            "Dream expert architecture: hidden_dim=%s ffn_dim=%s num_layers=%s "
+            "num_heads=%s attn_head_dim=%s num_dream_tokens=%s "
+            "target_num_params_m=%s actual_num_params_m=%.3f",
+            expert["hidden_dim"],
+            expert["ffn_dim"],
+            expert["num_layers"],
+            expert["num_heads"],
+            expert["attn_head_dim"],
+            expert["num_dream_tokens"],
+            expert["target_num_params_m"],
+            actual_num_params_m,
+        )
+        logger.info(
+            "Dream decoder architecture: decoder_dim=%s decoder_ffn_dim=%s "
+            "num_layers=%s num_heads=%s attn_head_dim=%s",
+            decoder["decoder_dim"],
+            decoder["decoder_ffn_dim"],
+            decoder["num_layers"],
+            decoder["num_heads"],
+            decoder["attn_head_dim"],
+        )
+        for modality, cfg in decoder["modalities"].items():
+            logger.info(
+                "Dream decoder modality: %s enabled=%s target_layout=%s target_shape=%s",
+                modality,
+                cfg["enabled"],
+                cfg["target_layout"],
+                cfg["target_shape"],
+            )
 
     @classmethod
     def from_wan22_pretrained(

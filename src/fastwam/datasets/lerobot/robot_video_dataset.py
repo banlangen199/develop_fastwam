@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import instantiate
-from .base_lerobot_dataset import BaseLerobotDataset
+from .base_lerobot_dataset import BaseLerobotDataset, resolve_lerobot_dataset_dirs
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -490,6 +490,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         dream_target=None,
     ):
         self.dataset_name = dataset_name
+        dataset_dirs = resolve_lerobot_dataset_dirs(dataset_dirs)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),

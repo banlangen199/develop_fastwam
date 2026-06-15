@@ -14,5 +14,5 @@ train:
     modalities: ["dyn", "depth", "dino", "sam"]
     depth:
       source: depth_anything
-      root: ./data/dream_modalities/depth_anything
-      model: depth_anything_v2
+      root: ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot/extras/depth_anything_v3_metric
+      model: depth_anything_v3

@@ -14,6 +14,34 @@ logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
 
+def resolve_lerobot_dataset_dir(dataset_dir: str) -> str:
+    ds_root = Path(dataset_dir)
+    if (ds_root / "meta" / "info.json").is_file():
+        return str(ds_root)
+
+    # Some local LIBERO dumps are nested as:
+    # data/libero_mujoco3.3.2/libero_mujoco3.3.2/<dataset_name>
+    # Keep configs on the clean top-level path, but resolve to the actual local
+    # LeRobot root when the configured directory is only a partial placeholder.
+    nested_root = ds_root.parent / ds_root.parent.name / ds_root.name
+    if (nested_root / "meta" / "info.json").is_file():
+        logger.warning(
+            "Configured dataset_dir `%s` is missing meta/info.json; using local nested LeRobot root `%s`.",
+            ds_root,
+            nested_root,
+        )
+        return str(nested_root)
+
+    raise FileNotFoundError(
+        f"LeRobot dataset directory `{ds_root}` is missing meta/info.json. "
+        f"Also checked `{nested_root}`. Fix dataset_dirs or place the full LeRobot dataset locally."
+    )
+
+
+def resolve_lerobot_dataset_dirs(dataset_dirs: List[str]) -> List[str]:
+    return [resolve_lerobot_dataset_dir(ds_dir) for ds_dir in dataset_dirs]
+
+
 class BaseLerobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -39,14 +67,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         assert past_obs_size == 0
         assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
         
-        self.dataset_dirs = dataset_dirs
+        self.dataset_dirs = resolve_lerobot_dataset_dirs(dataset_dirs)
         self.shape_meta = shape_meta
         self.action_size = action_size
         self.past_action_size = past_action_size
         self.obs_size = obs_size
         self.processor = None  # Will be set externally
         metas = []
-        for ds_dir in dataset_dirs:
+        for ds_dir in self.dataset_dirs:
             ds_root = Path(ds_dir)
             repo_id = ds_dir
             meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
