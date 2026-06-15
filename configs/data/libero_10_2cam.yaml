@@ -5,11 +5,14 @@ defaults:
 train:
   dataset_name: libero_10
   dataset_dirs:
-    - ./data/libero_mujoco3.3.2/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
   pretrained_norm_stats: null
   dream_target:
     enabled: true
     mode: fixed_offset
     future_offset: 4
     modalities: ["dyn", "depth", "dino", "sam"]
-
+    depth:
+      source: depth_anything
+      root: ./data/dream_modalities/depth_anything
+      model: depth_anything_v2

@@ -407,16 +407,29 @@ class DreamFastWAM(FastWAM):
             )
         dream_targets = inputs["dream_targets"]
 
-        noise_video = torch.randn_like(input_latents)
-        timestep_video = self.train_video_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=input_latents.dtype,
-        )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        train_video_branch = self.loss_lambda_video > 0.0
+        if train_video_branch:
+            noise_video = torch.randn_like(input_latents)
+            timestep_video = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            latents_video = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+            target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+            if inputs["first_frame_latents"] is not None:
+                latents_video[:, :, 0:1] = inputs["first_frame_latents"]
+        else:
+            current_frame_latents = inputs["first_frame_latents"]
+            if current_frame_latents is None:
+                current_frame_latents = input_latents[:, :, 0:1]
+            latents_video = current_frame_latents
+            timestep_video = torch.zeros(
+                (batch_size,),
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            target_video = None
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -428,7 +441,7 @@ class DreamFastWAM(FastWAM):
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
         video_pre = self.video_expert.pre_dit(
-            x=latents,
+            x=latents_video,
             timestep=timestep_video,
             context=context,
             context_mask=context_mask,
@@ -477,24 +490,29 @@ class DreamFastWAM(FastWAM):
                 "action": action_pre["t_mod"],
             },
         )
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_video = None
+        if train_video_branch:
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
         pred_dream = self.dream_expert.post_dit(tokens_out["dream"], dream_pre)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
-        loss_video_per_sample = self._compute_video_loss_per_sample(
-            pred_video=pred_video,
-            target_video=target_video,
-            image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
-        )
-        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
-        )
-        loss_video = (loss_video_per_sample * video_weight).mean()
+        if train_video_branch:
+            include_initial_video_step = inputs["first_frame_latents"] is None
+            if inputs["first_frame_latents"] is not None:
+                pred_video = pred_video[:, :, 1:]
+                target_video = target_video[:, :, 1:]
+            loss_video_per_sample = self._compute_video_loss_per_sample(
+                pred_video=pred_video,
+                target_video=target_video,
+                image_is_pad=image_is_pad,
+                include_initial_video_step=include_initial_video_step,
+            )
+            video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+            )
+            loss_video = (loss_video_per_sample * video_weight).mean()
+        else:
+            loss_video = pred_action.sum() * 0.0
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:
@@ -536,7 +554,8 @@ class DreamFastWAM(FastWAM):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_video: bool = False,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -573,10 +592,10 @@ class DreamFastWAM(FastWAM):
             },
             t_mod_all={"video": video_pre["t_mod"], "dream": dream_pre["t_mod"], "action": action_pre["t_mod"]},
         )
-        return (
-            self.video_expert.post_dit(tokens_out["video"], video_pre),
-            self.action_expert.post_dit(tokens_out["action"], action_pre),
-        )
+        pred_video = None
+        if return_video:
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        return pred_video, self.action_expert.post_dit(tokens_out["action"], action_pre)
 
     @torch.no_grad()
     def _predict_action_noise(

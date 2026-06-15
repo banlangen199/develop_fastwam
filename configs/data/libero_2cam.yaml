@@ -42,7 +42,7 @@ train:
     cameras: ["image", "wrist_image"]
     extra_roots:
       dyn: cotracker
-      depth: depth
+      depth: depth_anything_v3_metric
       dino: dinov2
       sam: sam
     array_keys:

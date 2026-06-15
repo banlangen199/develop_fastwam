@@ -176,6 +176,37 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
     def _get_additional_data(self, sample, lerobot_sample):
         return sample
 
+    def _metadata_from_sample_idx(self, sample_idx: int) -> Dict[str, torch.Tensor]:
+        start_idx = 0
+        for dataset_index, dataset in enumerate(self.multi_dataset._datasets):
+            dataset_len = int(dataset.num_frames)
+            if sample_idx >= start_idx + dataset_len:
+                start_idx += dataset_len
+                continue
+            local_idx = int(sample_idx - start_idx)
+            ep_from = dataset.episode_data_index["from"]
+            ep_to = dataset.episode_data_index["to"]
+            for selected_ep_idx, (from_idx, to_idx) in enumerate(zip(ep_from, ep_to)):
+                from_i = int(from_idx.item())
+                to_i = int(to_idx.item())
+                if local_idx < from_i or local_idx >= to_i:
+                    continue
+                episodes = getattr(dataset, "episodes", None)
+                if episodes is not None:
+                    episode_index = int(episodes[selected_ep_idx])
+                else:
+                    episode_index = int(selected_ep_idx)
+                frame_index = int(local_idx - from_i)
+                return {
+                    "dataset_index": torch.tensor(dataset_index, dtype=torch.int64),
+                    "episode_index": torch.tensor(episode_index, dtype=torch.int64),
+                    "frame_index": torch.tensor(frame_index, dtype=torch.int64),
+                }
+            raise RuntimeError(
+                f"Could not map local sample index {local_idx} to an episode in dataset_index={dataset_index}."
+            )
+        raise RuntimeError(f"Could not map sample index {sample_idx} to any underlying dataset.")
+
     def __getitem__(self, idx):
         if idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
@@ -213,9 +244,12 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "state": {},
             "images": {},
         }
+        generated_metadata = self._metadata_from_sample_idx(sample_idx)
         for key in ("dataset_index", "episode_index", "frame_index"):
             if key in lerobot_sample:
                 sample[key] = lerobot_sample[key]
+            else:
+                sample[key] = generated_metadata[key]
         for meta in self.state_meta:
             sample["state"][meta["key"]] = self._get_state(meta, lerobot_sample)
 

@@ -36,7 +36,7 @@ class DreamTargetAdapter:
     }
     DEFAULT_EXTRA_ROOTS = {
         "dyn": "cotracker",
-        "depth": "depth",
+        "depth": "depth_anything_v3_metric",
         "dino": "dinov2",
         "sam": "sam",
     }
@@ -54,6 +54,10 @@ class DreamTargetAdapter:
         self.mode = str(cfg.get("mode", "fixed_offset"))
         self.future_offset = int(cfg.get("future_offset", 4))
         self.modalities = list(cfg.get("modalities", ["dyn", "depth", "dino", "sam"]))
+        self.modality_configs = {
+            name: dict(cfg.get(name, {}) or {})
+            for name in self.DEFAULT_TOKEN_SPECS
+        }
         cameras = cfg.get("cameras", cfg.get("camera", ["image", "wrist_image"]))
         if isinstance(cameras, str):
             cameras = [cameras]
@@ -77,6 +81,13 @@ class DreamTargetAdapter:
             unknown = set(self.modalities) - set(self.DEFAULT_TOKEN_SPECS)
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
+            if "depth" in self.modalities:
+                depth_cfg = self.modality_configs.get("depth", {})
+                if depth_cfg.get("source") != "depth_anything" or not depth_cfg.get("root"):
+                    raise ValueError(
+                        "dream_target depth supervision must use Depth Anything: set "
+                        "dream_target.depth.source=depth_anything and dream_target.depth.root."
+                    )
 
     def has_enough_future(self, sample) -> bool:
         if not self.enabled:
@@ -93,8 +104,8 @@ class DreamTargetAdapter:
             return None
         if "dataset_index" not in sample or "episode_index" not in sample or "frame_index" not in sample:
             raise ValueError(
-                "dream_target requires sample metadata `dataset_index`, `episode_index`, and `frame_index`; "
-                "check that the processor preserves these keys."
+                "dream_target requires dataset_index / episode_index / frame_index, "
+                "but they were not found after preprocessing"
             )
         dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
         episode_index = int(torch.as_tensor(sample["episode_index"]).item())
@@ -110,6 +121,18 @@ class DreamTargetAdapter:
         return targets
 
     def _npz_path(self, ds_root: Path, modality: str, camera: str, episode_index: int) -> Path:
+        modality_cfg = self.modality_configs.get(modality, {})
+        root = modality_cfg.get("root")
+        if root:
+            root = Path(root)
+            candidates = [
+                root / ds_root.name / camera / f"episode_{episode_index:06d}.npz",
+                root / camera / f"episode_{episode_index:06d}.npz",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+            return candidates[0]
         extra_root = self.extra_roots.get(modality, modality)
         return ds_root / "extras" / extra_root / camera / f"episode_{episode_index:06d}.npz"
 
@@ -126,6 +149,11 @@ class DreamTargetAdapter:
 
     def _load_npz_array(self, path: Path, modality: str, frame_index: int) -> torch.Tensor:
         if not path.exists():
+            if modality == "depth" and self.modality_configs.get("depth", {}).get("root"):
+                raise FileNotFoundError(
+                    f"Missing Depth Anything dream target: {path}. "
+                    "Generate Depth Anything depth first; depth dream supervision does not fallback to the raw depth folder."
+                )
             raise FileNotFoundError(
                 f"Missing dream target data for modality={modality!r}: {path}. "
                 "Run the corresponding preprocessing job or disable/remove this modality in dream_target.modalities."
@@ -336,6 +364,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         
     def __len__(self):
         return len(self.lerobot_dataset)
+
+    def debug_sample_metadata(self, idx: int = 0):
+        sample = self[idx]
+        print("sample.keys()", sorted(sample.keys()))
+        for key in ("dataset_index", "episode_index", "frame_index"):
+            print(f"sample[{key!r}]", sample[key])
+        if "dream_targets" in sample:
+            print("dream_targets", {k: tuple(v.shape) for k, v in sample["dream_targets"].items()})
+        return sample
 
     def _get(self, idx):
         sample_idx = idx
