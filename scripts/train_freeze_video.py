@@ -27,13 +27,13 @@ from fastwam.utils.config_resolvers import register_default_resolvers
 
 logger = logging.getLogger(__name__)
 
-# ── monkey-patch: freeze video expert during _apply_dit_only_train_mode ──────
-_original_apply_dit_only = Wan22Trainer._apply_dit_only_train_mode
+# ── monkey-patch: freeze video expert during _set_dit_only_train_mode ──────
+_original_set_dit_only = Wan22Trainer._set_dit_only_train_mode
 
 
-@staticmethod
-def _freeze_video_apply_dit_only(model, freeze_video_expert: bool = True):  # noqa: ARG001
+def _freeze_video_set_dit_only(self):
     """Same as original but additionally freezes ``mixtures.video`` in the MoT."""
+    model = self.accelerator.unwrap_model(self.model)
     model.eval()
     model.requires_grad_(False)
     model.dit.train()
@@ -70,7 +70,48 @@ def _freeze_video_apply_dit_only(model, freeze_video_expert: bool = True):  # no
         proprio_encoder.requires_grad_(True)
 
 
-Wan22Trainer._apply_dit_only_train_mode = _freeze_video_apply_dit_only
+Wan22Trainer._set_dit_only_train_mode = _freeze_video_set_dit_only
+
+
+# ── monkey-patch: exclude video expert from optimizer params ──────────────────
+_original_configure_trainable = Wan22Trainer._configure_trainable_parameters
+
+
+def _freeze_video_configure_trainable(self, model):
+    """Same as original but excludes ``mixtures.video`` from returned params."""
+    if hasattr(model, "configure_trainable_parameters"):
+        return model.configure_trainable_parameters(freeze_video_expert=self.freeze_video_expert)
+
+    model.eval()
+    model.requires_grad_(False)
+    model.dit.train()
+    model.dit.requires_grad_(True)
+
+    # Freeze video expert before collecting params for optimizer
+    if hasattr(model.dit, "mixtures") and "video" in model.dit.mixtures:
+        video_expert = model.dit.mixtures["video"]
+        video_expert.eval()
+        video_expert.requires_grad_(False)
+        video_params = sum(p.numel() for p in video_expert.parameters())
+        logger.info(
+            "Video expert FROZEN (no optimizer states) — %.2f B params.",
+            video_params / 1e9,
+        )
+
+    proprio_encoder = getattr(model, "proprio_encoder", None)
+    if proprio_encoder is not None:
+        proprio_encoder.train()
+        proprio_encoder.requires_grad_(True)
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    logger.info(
+        "Trainable parameters (video-excluded): %.3fM",
+        sum(p.numel() for p in params) / 1e6,
+    )
+    return params
+
+
+Wan22Trainer._configure_trainable_parameters = _freeze_video_configure_trainable
 
 register_default_resolvers()
 

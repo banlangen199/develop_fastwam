@@ -455,17 +455,29 @@ class FastWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         image_is_pad = inputs["image_is_pad"]
 
-        noise_video = torch.randn_like(input_latents)
-        timestep_video = self.train_video_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=input_latents.dtype,
-        )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        train_video_branch = self.loss_lambda_video > 0.0
+        if train_video_branch:
+            noise_video = torch.randn_like(input_latents)
+            timestep_video = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+            target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+            if inputs["first_frame_latents"] is not None:
+                latents[:, :, 0:1] = inputs["first_frame_latents"]
+        else:
+            current_frame_latents = inputs["first_frame_latents"]
+            if current_frame_latents is None:
+                current_frame_latents = input_latents[:, :, 0:1]
+            latents = current_frame_latents
+            timestep_video = torch.zeros(
+                (batch_size,),
+                device=self.device,
+                dtype=input_latents.dtype,
+            )
+            target_video = None
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -527,25 +539,30 @@ class FastWAM(torch.nn.Module):
             },
         )
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_video = None
+        if train_video_branch:
+            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
 
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+        if train_video_branch:
+            include_initial_video_step = inputs["first_frame_latents"] is None
+            if inputs["first_frame_latents"] is not None:
+                pred_video = pred_video[:, :, 1:]
+                target_video = target_video[:, :, 1:]
 
-        loss_video_per_sample = self._compute_video_loss_per_sample(
-            pred_video=pred_video,
-            target_video=target_video,
-            image_is_pad=image_is_pad,
-            include_initial_video_step=include_initial_video_step,
-        )
-        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
-            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
-        )
-        loss_video = (loss_video_per_sample * video_weight).mean()
+            loss_video_per_sample = self._compute_video_loss_per_sample(
+                pred_video=pred_video,
+                target_video=target_video,
+                image_is_pad=image_is_pad,
+                include_initial_video_step=include_initial_video_step,
+            )
+            video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+                loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+            )
+            loss_video = (loss_video_per_sample * video_weight).mean()
+        else:
+            loss_video = pred_action.sum() * 0.0
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
         if action_is_pad is not None:

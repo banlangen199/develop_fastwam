@@ -55,4 +55,5 @@ action_scheduler:
   num_train_timesteps: 1000
 
 loss:
+  lambda_video: 1.0
   lambda_action: 1.0

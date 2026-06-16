@@ -62,8 +62,8 @@ dream_query_config:
   dream_expert:
     target_num_params_m: 200
 
-    hidden_dim: 256
-    ffn_dim: 1024
+    hidden_dim: 384
+    ffn_dim: 1536
     num_layers: 30
     num_heads: 24
     attn_head_dim: 128
@@ -71,8 +71,8 @@ dream_query_config:
     share_blocks: false
 
   dream_decoder:
-    decoder_dim: 256
-    decoder_ffn_dim: 1024
+    decoder_dim: 384
+    decoder_ffn_dim: 1536
     num_layers: 2
     num_heads: 24
     attn_head_dim: 128
