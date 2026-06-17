@@ -58,7 +58,7 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
   esac
 done
 
-RUN_ID="${RUN_ID:-$(date +%Y-%m-%d_%H-%M-%S)}"
+RUN_ID="${RUN_ID:-$(date +%Y-%m-%d_%H-%M-%S)_${RANDOM}}"
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 

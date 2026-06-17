@@ -54,10 +54,10 @@ dream_query_config:
   share_blocks: false
 
   dream_query:
-    n_dyn: 8
-    n_depth: 8
-    n_dino: 8
-    n_sam: 8
+    n_dyn: 18
+    n_depth: 18
+    n_dino: 18
+    n_sam: 18
 
   dream_expert:
     target_num_params_m: 200

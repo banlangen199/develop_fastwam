@@ -36,7 +36,7 @@ freeze_video_expert: false
 wandb:
   enabled: false
   workspace: null
-  project: fast-wam
+  project: dream_fastwam
   name: train
   group: null
   mode: online

@@ -58,7 +58,7 @@ done
 
 if [[ -z "${RUN_ID:-}" ]]; then
   if (( NUM_MACHINES <= 1 )); then
-    RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)"
+    RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)_${RANDOM}"
   else
     RUN_ID_SYNC_TIMEOUT="${RUN_ID_SYNC_TIMEOUT:-180}"
     RUN_ID_SYNC_PORT="${RUN_ID_SYNC_PORT:-$((MAIN_PROCESS_PORT + 11))}"
@@ -74,6 +74,7 @@ if [[ -z "${RUN_ID:-}" ]]; then
       python - <<'PY'
 import datetime
 import os
+import random
 from datetime import timedelta
 
 import torch.distributed as dist
@@ -94,7 +95,7 @@ store = dist.TCPStore(
 )
 key = f"run_id::{task_basename}"
 if machine_rank == 0:
-    run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{random.randint(100000, 999999)}"
     store.set(key, run_id)
 run_id = store.get(key).decode("utf-8")
 print(run_id)
