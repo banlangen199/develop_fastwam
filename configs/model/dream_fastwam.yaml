@@ -110,6 +110,14 @@ action_scheduler:
   infer_shift: 5.0
   num_train_timesteps: 1000
 
+action_noise:
+  use_correlated_noise_train: false
+  use_correlated_noise_infer: false
+  correlation_beta: 0.5
+  jitter: 1.0e-5
+  dataset_stats_path: null
+  action_key: default
+
 loss:
   lambda_action: 1.0
   lambda_video: 1.0

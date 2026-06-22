@@ -10,7 +10,7 @@ train:
   dream_target:
     enabled: true
     mode: fixed_offset
-    future_offset: 4
+    future_offset: 32
     modalities: ["dyn", "depth", "dino", "sam"]
     depth:
       source: depth_anything

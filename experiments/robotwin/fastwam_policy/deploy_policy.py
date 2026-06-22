@@ -135,6 +135,22 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _maybe_load_action_noise_stats(model: torch.nn.Module, model_cfg: DictConfig, dataset_stats_path: Path) -> None:
+    action_noise_cfg = model_cfg.get("action_noise", {})
+    use_correlated = bool(action_noise_cfg.get("use_correlated_noise_train", False)) or bool(
+        action_noise_cfg.get("use_correlated_noise_infer", False)
+    )
+    if not use_correlated:
+        return
+    if not hasattr(model, "load_action_noise_stats"):
+        raise ValueError("Configured correlated action noise, but the model does not support action noise stats.")
+    stats_path = action_noise_cfg.get("dataset_stats_path") or str(dataset_stats_path)
+    model.load_action_noise_stats(
+        stats_path,
+        action_key=str(action_noise_cfg.get("action_key", "default")),
+    )
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -161,6 +177,7 @@ class WorldActionRobotWinPolicy:
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
+        _maybe_load_action_noise_stats(self.model, model_cfg_copy, dataset_stats_path)
         self.model = self.model.to(device).eval()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()

@@ -33,6 +33,7 @@ class FastWAMProcessor(BaseProcessor):
         # image transform
         train_transforms: Dict[str, List[Any]] | None,
         val_transforms: Dict[str, List[Any]] | None, 
+        action_normalization: Optional[Dict[str, Any]] = None,
 
         # instruction transform
         drop_high_level_prob: float = 1.0,
@@ -60,7 +61,14 @@ class FastWAMProcessor(BaseProcessor):
         self.action_state_merger = action_state_merger
         self.action_state_merger.set_shape_meta(self.shape_meta)
 
-        self.use_stepwise_action_norm = use_stepwise_action_norm
+        if action_normalization is None:
+            action_normalization = {}
+        self.use_stepwise_action_norm = bool(
+            action_normalization.get("use_per_timestep_norm", use_stepwise_action_norm)
+        )
+        self.strict_stepwise_action_stats = bool(
+            action_normalization.get("strict_per_timestep_stats", False)
+        )
         self.norm_default_mode = norm_default_mode
         self.norm_exception_mode = norm_exception_mode
         self._normalizer = None
@@ -115,6 +123,7 @@ class FastWAMProcessor(BaseProcessor):
             default_mode=self.norm_default_mode,
             exception_mode=self.norm_exception_mode,
             stats=dataset_stats,
+            strict_stepwise_action_stats=self.strict_stepwise_action_stats,
         )
 
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:

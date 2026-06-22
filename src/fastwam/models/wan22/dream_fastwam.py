@@ -144,6 +144,7 @@ class DreamFastWAM(FastWAM):
         loss_lambda_depth: float = 1.0,
         loss_lambda_dino: float = 1.0,
         loss_lambda_sam: float = 1.0,
+        action_noise: Optional[dict[str, Any]] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for DreamFastWAM.")
@@ -210,6 +211,7 @@ class DreamFastWAM(FastWAM):
             loss_lambda_depth=loss_lambda_depth,
             loss_lambda_dino=loss_lambda_dino,
             loss_lambda_sam=loss_lambda_sam,
+            action_noise=action_noise,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -495,7 +497,10 @@ class DreamFastWAM(FastWAM):
             )
             target_video = None
 
-        noise_action = torch.randn_like(action)
+        noise_action = self._sample_action_noise(
+            action,
+            use_correlated_noise=self.use_correlated_noise_train,
+        )
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
@@ -731,12 +736,21 @@ class DreamFastWAM(FastWAM):
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action_shape = (1, action_horizon, self.action_expert.action_dim)
+        latents_action_base = torch.empty(latents_action_shape, device=rand_device, dtype=torch.float32)
+        if self.use_correlated_noise_infer:
+            latents_action = self._sample_action_noise(
+                latents_action_base,
+                use_correlated_noise=True,
+                generator=generator,
+            ).to(device=self.device, dtype=self.torch_dtype)
+        else:
+            latents_action = torch.randn(
+                latents_action_shape,
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)

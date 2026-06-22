@@ -327,6 +327,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         action_var = DefaultDict(list)
         action_q01 = DefaultDict(list)
         action_q99 = DefaultDict(list)
+        action_chunks = DefaultDict(list)
 
         episodes_num = self.multi_dataset.num_episodes
         
@@ -357,6 +358,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                     action_var[key].append(cur_action.var(0))
                     action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
                     action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
+                    action_chunks[key].append(cur_action.detach().to(device="cpu", dtype=torch.float32))
         
         else:
             with ThreadPoolExecutor() as executor:
@@ -384,6 +386,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                             action_var[key].append(cur_action.var(0))
                             action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
                             action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
+                            action_chunks[key].append(cur_action.detach().to(device="cpu", dtype=torch.float32))
 
                     except Exception as e:
                         logger.error(f"Error processing episode: {e}")
@@ -434,6 +437,32 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 stats["action"][key]["global_mean"], 
                 stats["action"][key]["global_std"],
             ) = get_mean_std(action_mean[key], action_var[key])
+            stats["action"][key]["action_mean_timestep"] = stats["action"][key]["stepwise_mean"]
+            stats["action"][key]["action_std_timestep"] = stats["action"][key]["stepwise_std"].clamp_min(1e-6)
+            actions = torch.cat(action_chunks[key], dim=0)
+            stats["action"][key]["action_horizon"] = int(actions.shape[1])
+            stats["action"][key]["action_dim"] = int(actions.shape[2])
+            stepwise_mean = stats["action"][key]["action_mean_timestep"].to(dtype=torch.float32)
+            stepwise_std = stats["action"][key]["action_std_timestep"].to(dtype=torch.float32).clamp_min(1e-6)
+            flat = ((actions - stepwise_mean.unsqueeze(0)) / stepwise_std.unsqueeze(0)).reshape(actions.shape[0], -1)
+            flat = flat - flat.mean(dim=0, keepdim=True)
+            denom = max(int(flat.shape[0]) - 1, 1)
+            cov = flat.T @ flat / denom
+            beta = float(getattr(self, "action_correlation_beta", 0.5))
+            jitter = float(getattr(self, "action_correlation_jitter", 1e-5))
+            eye = torch.eye(cov.shape[0], dtype=cov.dtype)
+            cov_reg = beta * cov + (1.0 - beta) * eye
+            stats["action"][key]["action_correlation_beta"] = beta
+            stats["action"][key]["action_correlation_jitter"] = jitter
+            try:
+                stats["action"][key]["action_correlation_cholesky"] = torch.linalg.cholesky(
+                    cov_reg + jitter * eye
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Failed to compute action_correlation_cholesky for action {key!r}; "
+                    f"try increasing action_stats_correlation_jitter. Original error: {exc}"
+                ) from exc
 
         return stats
 

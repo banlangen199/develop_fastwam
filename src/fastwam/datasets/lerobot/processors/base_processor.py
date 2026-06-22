@@ -35,7 +35,8 @@ class BaseProcessor(ABC):
         drop_high_level_prob: float,
         use_zh_instruction: bool,
 
-        tokenizer: Any
+        tokenizer: Any,
+        action_normalization: Optional[Dict[str, Any]] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
@@ -56,7 +57,14 @@ class BaseProcessor(ABC):
         self.action_state_merger = action_state_merger
         self.action_state_merger.set_shape_meta(self.shape_meta)
 
-        self.use_stepwise_action_norm = use_stepwise_action_norm
+        if action_normalization is None:
+            action_normalization = {}
+        self.use_stepwise_action_norm = bool(
+            action_normalization.get("use_per_timestep_norm", use_stepwise_action_norm)
+        )
+        self.strict_stepwise_action_stats = bool(
+            action_normalization.get("strict_per_timestep_stats", False)
+        )
         self.norm_default_mode = norm_default_mode
         self.norm_exception_mode = norm_exception_mode
         self._normalizer = None
@@ -90,6 +98,7 @@ class BaseProcessor(ABC):
             default_mode=self.norm_default_mode,
             exception_mode=self.norm_exception_mode,
             stats=dataset_stats,
+            strict_stepwise_action_stats=self.strict_stepwise_action_stats,
         )
 
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:

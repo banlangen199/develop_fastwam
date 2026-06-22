@@ -31,6 +31,8 @@ train:
   pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
+  action_stats_correlation_beta: 0.5
+  action_stats_correlation_jitter: 1.0e-5
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
@@ -44,6 +46,9 @@ train:
     # action_state_transforms:
     #   - _target_: fastwam.datasets.lerobot.transforms.libero.LiberoTransform
     use_stepwise_action_norm: False
+    action_normalization:
+      use_per_timestep_norm: false
+      strict_per_timestep_stats: false
     norm_default_mode: "z-score"
     norm_exception_mode: null
 
@@ -94,6 +99,8 @@ val:
   pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
+  action_stats_correlation_beta: 0.5
+  action_stats_correlation_jitter: 1.0e-5
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
@@ -107,6 +114,9 @@ val:
     # action_state_transforms:
     #   - _target_: fastwam.datasets.lerobot.transforms.libero.LiberoTransform
     use_stepwise_action_norm: False
+    action_normalization:
+      use_per_timestep_norm: false
+      strict_per_timestep_stats: false
     norm_default_mode: "z-score"
     norm_exception_mode: null
 

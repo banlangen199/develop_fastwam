@@ -152,6 +152,22 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     )
 
 
+def _maybe_load_action_noise_stats(model: torch.nn.Module, cfg: DictConfig, dataset_stats_path: Path) -> None:
+    action_noise_cfg = cfg.model.get("action_noise", {})
+    use_correlated = bool(action_noise_cfg.get("use_correlated_noise_train", False)) or bool(
+        action_noise_cfg.get("use_correlated_noise_infer", False)
+    )
+    if not use_correlated:
+        return
+    if not hasattr(model, "load_action_noise_stats"):
+        raise ValueError("Configured correlated action noise, but the model does not support action noise stats.")
+    stats_path = action_noise_cfg.get("dataset_stats_path") or str(dataset_stats_path)
+    model.load_action_noise_stats(
+        stats_path,
+        action_key=str(action_noise_cfg.get("action_key", "default")),
+    )
+
+
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
@@ -703,6 +719,7 @@ def eval_single_process(cfg: DictConfig):
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
+    _maybe_load_action_noise_stats(model, cfg, dataset_stats_path)
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
     logging.info("Using dataset stats: %s", dataset_stats_path)

@@ -52,6 +52,7 @@ class DreamTargetAdapter:
         self.enabled = bool(cfg.get("enabled", False))
         self.mode = str(cfg.get("mode", "fixed_offset"))
         self.future_offset = int(cfg.get("future_offset", 4))
+        self.max_resample_retry = int(cfg.get("max_resample_retry", 100))
         self.modalities = list(cfg.get("modalities", ["dyn", "depth", "dino", "sam"]))
         self.modality_configs = {name: dict(cfg.get(name, {}) or {}) for name in self.MODALITIES}
         cameras = cfg.get("cameras", cfg.get("camera", ["image", "wrist_image"]))
@@ -72,6 +73,7 @@ class DreamTargetAdapter:
             if shape is not None
         }
         self.dataset_dirs = [Path(p) for p in dataset_dirs]
+        self._frame_index_cache = {}
 
         if self.enabled:
             if self.mode != "fixed_offset":
@@ -101,7 +103,47 @@ class DreamTargetAdapter:
             raise ValueError("dream_target requires `image_is_pad` to skip samples without t+future_offset.")
         if self.future_offset >= int(image_is_pad.shape[0]):
             return False
-        return not bool(image_is_pad[self.future_offset].item())
+        if bool(image_is_pad[self.future_offset].item()):
+            return False
+        return self.has_target_frames(sample)
+
+    def has_target_frames(self, sample) -> bool:
+        if not self.enabled:
+            return True
+        if "dataset_index" not in sample or "episode_index" not in sample or "frame_index" not in sample:
+            return False
+        dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
+        episode_index = int(torch.as_tensor(sample["episode_index"]).item())
+        frame_index = int(torch.as_tensor(sample["frame_index"]).item())
+        target_frame = frame_index + self.future_offset
+        ds_root = self.dataset_dirs[dataset_index]
+        for modality in self.modalities:
+            frames = (frame_index, target_frame) if modality == "dyn" else (target_frame,)
+            for camera in self.cameras:
+                path = self._npz_path(ds_root, modality, camera, episode_index)
+                for required_frame in frames:
+                    if not self._npz_has_frame(path, required_frame):
+                        return False
+        return True
+
+    def _npz_has_frame(self, path: Path, frame_index: int) -> bool:
+        path = Path(path)
+        cache_key = str(path)
+        if cache_key not in self._frame_index_cache:
+            if not path.exists():
+                self._frame_index_cache[cache_key] = None
+            else:
+                with np.load(path) as payload:
+                    if "frame_index" in payload.files:
+                        self._frame_index_cache[cache_key] = set(int(x) for x in payload["frame_index"].tolist())
+                    else:
+                        self._frame_index_cache[cache_key] = True
+        available = self._frame_index_cache[cache_key]
+        if available is True:
+            return True
+        if available is None:
+            return False
+        return int(frame_index) in available
 
     def build(self, sample):
         if not self.enabled:
@@ -488,6 +530,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         dream_target=None,
+        action_stats_correlation_beta: float = 0.5,
+        action_stats_correlation_jitter: float = 1e-5,
     ):
         self.dataset_name = dataset_name
         dataset_dirs = resolve_lerobot_dataset_dirs(dataset_dirs)
@@ -503,6 +547,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
+        self.lerobot_dataset.action_correlation_beta = float(action_stats_correlation_beta)
+        self.lerobot_dataset.action_correlation_jitter = float(action_stats_correlation_jitter)
         
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
@@ -589,7 +635,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def _get(self, idx):
         sample_idx = idx
         sample = None
-        for attempt in range(self.max_padding_retry + 1):
+        dream_retry_limit = self.dream_target_adapter.max_resample_retry if self.dream_target_adapter.enabled else 0
+        retry_limit = max(self.max_padding_retry, dream_retry_limit)
+        for attempt in range(retry_limit + 1):
             sample = self.lerobot_dataset[sample_idx]
 
             needs_resample = False
@@ -610,7 +658,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if bool(proprio_is_pad.any().item()):
                 has_pad = True
 
-            if not has_pad or attempt >= self.max_padding_retry:
+            cur_retry_limit = dream_retry_limit if needs_resample else self.max_padding_retry
+            if not has_pad or attempt >= cur_retry_limit:
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))

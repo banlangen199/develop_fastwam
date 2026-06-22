@@ -85,6 +85,7 @@ def create_fastwam(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    action_noise=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -132,6 +133,12 @@ def create_fastwam(
         loss = {}
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+    if isinstance(action_noise, DictConfig):
+        action_noise = OmegaConf.to_container(action_noise, resolve=True)
+    if action_noise is None:
+        action_noise = {}
+    if not isinstance(action_noise, dict):
+        raise ValueError(f"`action_noise` must be dict-like, got {type(action_noise)}")
 
     return FastWAM.from_wan22_pretrained(
         device=device,
@@ -155,6 +162,7 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_noise=action_noise,
     )
 
 
@@ -171,6 +179,7 @@ def create_dream_fastwam(
     skip_dit_load_from_pretrain: bool = False,
     video_scheduler=None,
     action_scheduler=None,
+    action_noise=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
@@ -225,6 +234,12 @@ def create_dream_fastwam(
         loss = {}
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+    if isinstance(action_noise, DictConfig):
+        action_noise = OmegaConf.to_container(action_noise, resolve=True)
+    if action_noise is None:
+        action_noise = {}
+    if not isinstance(action_noise, dict):
+        raise ValueError(f"`action_noise` must be dict-like, got {type(action_noise)}")
 
     return DreamFastWAM.from_wan22_pretrained(
         device=device,
@@ -254,6 +269,7 @@ def create_dream_fastwam(
         loss_lambda_depth=float(loss.get("lambda_depth", 1.0)),
         loss_lambda_dino=float(loss.get("lambda_dino", 1.0)),
         loss_lambda_sam=float(loss.get("lambda_sam", 1.0)),
+        action_noise=action_noise,
     )
 
 
@@ -470,6 +486,17 @@ def run_training(cfg: DictConfig):
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     train_ds, val_ds = build_datasets(cfg.data)
+    action_noise_cfg = cfg.model.get("action_noise", {})
+    if bool(action_noise_cfg.get("use_correlated_noise_train", False)) or bool(
+        action_noise_cfg.get("use_correlated_noise_infer", False)
+    ):
+        stats_path = action_noise_cfg.get("dataset_stats_path") or os.path.join(misc.get_work_dir(), "dataset_stats.json")
+        if not hasattr(model, "load_action_noise_stats"):
+            raise ValueError("Configured correlated action noise, but the model does not support action noise stats.")
+        model.load_action_noise_stats(
+            stats_path,
+            action_key=str(action_noise_cfg.get("action_key", "default")),
+        )
 
     trainer = Wan22Trainer(
         cfg=cfg,

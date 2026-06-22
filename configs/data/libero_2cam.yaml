@@ -38,6 +38,7 @@ train:
     enabled: false
     mode: fixed_offset
     future_offset: 4
+    max_resample_retry: 100
     modalities: ["dyn", "depth", "dino", "sam"]
     cameras: ["image", "wrist_image"]
     extra_roots:
@@ -78,6 +79,8 @@ train:
       target_layout: grid_feature
     sam:
       target_layout: grid_feature
+  action_stats_correlation_beta: 0.5
+  action_stats_correlation_jitter: 1.0e-5
   processor:
     _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
     shape_meta: ${data.train.shape_meta}
@@ -93,6 +96,9 @@ train:
     # action_state_transforms:
     #   - _target_: fastwam.datasets.lerobot.transforms.libero.LiberoTransform
     use_stepwise_action_norm: False
+    action_normalization:
+      use_per_timestep_norm: false
+      strict_per_timestep_stats: false
     norm_default_mode: min/max
     norm_exception_mode: null
 

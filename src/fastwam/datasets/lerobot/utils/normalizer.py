@@ -23,7 +23,8 @@ class LinearNormalizer:
             use_stepwise_action_norm,
             default_mode: NormMode, 
             exception_mode: Dict[str, Dict[str, NormMode]], 
-            stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]]
+            stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
+            strict_stepwise_action_stats: bool = False,
         ):
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
@@ -33,14 +34,41 @@ class LinearNormalizer:
             key = meta["key"]
             
             if use_stepwise_action_norm:
-                cur_stats = {k.removeprefix("stepwise_"): v for k, v in stats["action"][key].items() if k.startswith("stepwise_")}
+                action_stats = stats["action"][key]
+                if "action_mean_timestep" in action_stats and "action_std_timestep" in action_stats:
+                    cur_stats = {
+                        "mean": action_stats["action_mean_timestep"],
+                        "std": action_stats["action_std_timestep"].clamp_min(1e-6),
+                    }
+                elif "stepwise_mean" in action_stats and "stepwise_std" in action_stats:
+                    cur_stats = {
+                        "mean": action_stats["stepwise_mean"],
+                        "std": action_stats["stepwise_std"].clamp_min(1e-6),
+                    }
+                elif strict_stepwise_action_stats:
+                    raise ValueError(
+                        f"use_per_timestep_norm/use_stepwise_action_norm is enabled for action {key!r}, "
+                        "but dataset stats do not contain action_mean_timestep/action_std_timestep "
+                        "or stepwise_mean/stepwise_std."
+                    )
+                else:
+                    logger.warning(
+                        "use_per_timestep_norm/use_stepwise_action_norm is enabled for action %r, "
+                        "but per-timestep mean/std stats are missing. Falling back to global mean/std stats.",
+                        key,
+                    )
+                    cur_stats = {
+                        "mean": action_stats["global_mean"],
+                        "std": action_stats["global_std"].clamp_min(1e-6),
+                    }
+                cur_mode = "z-score"
             else:
                 cur_stats = {k.removeprefix("global_"): v for k, v in stats["action"][key].items() if k.startswith("global_")}
 
-            if exception_mode is not None and "action" in exception_mode and key in exception_mode["action"]:
-                cur_mode = exception_mode["action"][key]
-            else:
-                cur_mode = default_mode
+                if exception_mode is not None and "action" in exception_mode and key in exception_mode["action"]:
+                    cur_mode = exception_mode["action"][key]
+                else:
+                    cur_mode = default_mode
 
             self.normalizers["action"][key] = SingleFieldLinearNormalizer(
                 stats=cur_stats, 

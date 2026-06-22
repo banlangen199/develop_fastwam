@@ -8,6 +8,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .action_stats import load_action_correlation_cholesky, sample_action_noise_like
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -38,6 +39,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_noise: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,8 +86,37 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        action_noise = {} if action_noise is None else dict(action_noise)
+        self.use_correlated_noise_train = bool(action_noise.get("use_correlated_noise_train", False))
+        self.use_correlated_noise_infer = bool(action_noise.get("use_correlated_noise_infer", False))
+        self.action_noise_correlation_beta = float(action_noise.get("correlation_beta", 0.5))
+        self.action_noise_jitter = float(action_noise.get("jitter", 1e-5))
+        self.action_noise_stats_path = action_noise.get("dataset_stats_path", None)
+        self.action_noise_action_key = str(action_noise.get("action_key", "default"))
+        self.register_buffer("action_correlation_cholesky", None, persistent=False)
+        if self.action_noise_stats_path is not None:
+            self.load_action_noise_stats(self.action_noise_stats_path, action_key=self.action_noise_action_key)
 
         self.to(self.device)
+
+    def load_action_noise_stats(self, dataset_stats_path: str, action_key: str = "default") -> None:
+        chol = load_action_correlation_cholesky(dataset_stats_path, action_key=action_key)
+        self.action_correlation_cholesky = chol.to(device=self.device, dtype=torch.float32)
+        self.action_noise_stats_path = str(dataset_stats_path)
+        self.action_noise_action_key = str(action_key)
+        logger.info(
+            "Loaded action_correlation_cholesky from %s with shape %s",
+            dataset_stats_path,
+            tuple(chol.shape),
+        )
+
+    def _sample_action_noise(self, action: torch.Tensor, *, use_correlated_noise: bool, generator=None) -> torch.Tensor:
+        return sample_action_noise_like(
+            action,
+            use_correlated_noise=use_correlated_noise,
+            action_correlation_cholesky=self.action_correlation_cholesky,
+            generator=generator,
+        )
 
     @classmethod
     def from_wan22_pretrained(
@@ -111,6 +142,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_noise: Optional[dict[str, Any]] = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +200,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            action_noise=action_noise,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -479,7 +512,10 @@ class FastWAM(torch.nn.Module):
             )
             target_video = None
 
-        noise_action = torch.randn_like(action)
+        noise_action = self._sample_action_noise(
+            action,
+            use_correlated_noise=self.use_correlated_noise_train,
+        )
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
@@ -827,12 +863,21 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=action_generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action_shape = (1, action_horizon, self.action_expert.action_dim)
+        latents_action_base = torch.empty(latents_action_shape, device=rand_device, dtype=torch.float32)
+        if self.use_correlated_noise_infer:
+            latents_action = self._sample_action_noise(
+                latents_action_base,
+                use_correlated_noise=True,
+                generator=action_generator,
+            ).to(device=self.device, dtype=self.torch_dtype)
+        else:
+            latents_action = torch.randn(
+                latents_action_shape,
+                generator=action_generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -967,12 +1012,21 @@ class FastWAM(torch.nn.Module):
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        latents_action_shape = (1, action_horizon, self.action_expert.action_dim)
+        latents_action_base = torch.empty(latents_action_shape, device=rand_device, dtype=torch.float32)
+        if self.use_correlated_noise_infer:
+            latents_action = self._sample_action_noise(
+                latents_action_base,
+                use_correlated_noise=True,
+                generator=generator,
+            ).to(device=self.device, dtype=self.torch_dtype)
+        else:
+            latents_action = torch.randn(
+                latents_action_shape,
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
