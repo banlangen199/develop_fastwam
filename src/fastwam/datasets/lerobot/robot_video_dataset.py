@@ -51,7 +51,15 @@ class DreamTargetAdapter:
         cfg = {} if cfg is None else dict(cfg)
         self.enabled = bool(cfg.get("enabled", False))
         self.mode = str(cfg.get("mode", "fixed_offset"))
-        self.future_offset = int(cfg.get("future_offset", 4))
+        future_offsets = cfg.get("future_offsets", None)
+        if future_offsets is None:
+            future_offsets = cfg.get("future_steps", cfg.get("future_offset", 4))
+        if isinstance(future_offsets, int):
+            future_offsets = [future_offsets]
+        self.future_offsets = [int(x) for x in future_offsets]
+        if not self.future_offsets:
+            raise ValueError("dream_target.future_offsets must contain at least one offset.")
+        self.future_offset = int(self.future_offsets[-1])
         self.max_resample_retry = int(cfg.get("max_resample_retry", 100))
         self.modalities = list(cfg.get("modalities", ["dyn", "depth", "dino", "sam"]))
         self.modality_configs = {name: dict(cfg.get(name, {}) or {}) for name in self.MODALITIES}
@@ -78,8 +86,8 @@ class DreamTargetAdapter:
         if self.enabled:
             if self.mode != "fixed_offset":
                 raise ValueError(f"Unsupported dream_target.mode={self.mode!r}; only 'fixed_offset' is implemented.")
-            if self.future_offset <= 0:
-                raise ValueError(f"dream_target.future_offset must be > 0, got {self.future_offset}")
+            if any(offset <= 0 for offset in self.future_offsets):
+                raise ValueError(f"dream_target.future_offsets must be > 0, got {self.future_offsets}")
             unknown = set(self.modalities) - self.MODALITIES
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
@@ -98,16 +106,19 @@ class DreamTargetAdapter:
     def has_enough_future(self, sample) -> bool:
         if not self.enabled:
             return True
+        return True
+
+    def _offset_in_episode(self, sample, offset: int) -> bool:
         image_is_pad = sample.get("image_is_pad", None)
         if image_is_pad is None:
             raise ValueError("dream_target requires `image_is_pad` to skip samples without t+future_offset.")
-        if self.future_offset >= int(image_is_pad.shape[0]):
+        if offset >= int(image_is_pad.shape[0]):
             return False
-        if bool(image_is_pad[self.future_offset].item()):
+        if bool(image_is_pad[offset].item()):
             return False
-        return self.has_target_frames(sample)
+        return True
 
-    def has_target_frames(self, sample) -> bool:
+    def has_target_frames(self, sample, offset: int) -> bool:
         if not self.enabled:
             return True
         if "dataset_index" not in sample or "episode_index" not in sample or "frame_index" not in sample:
@@ -115,7 +126,7 @@ class DreamTargetAdapter:
         dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
         episode_index = int(torch.as_tensor(sample["episode_index"]).item())
         frame_index = int(torch.as_tensor(sample["frame_index"]).item())
-        target_frame = frame_index + self.future_offset
+        target_frame = frame_index + int(offset)
         ds_root = self.dataset_dirs[dataset_index]
         for modality in self.modalities:
             frames = (frame_index, target_frame) if modality == "dyn" else (target_frame,)
@@ -145,6 +156,26 @@ class DreamTargetAdapter:
             return False
         return int(frame_index) in available
 
+    def _zero_target(self, modality: str) -> torch.Tensor:
+        if modality not in self.target_shapes:
+            raise ValueError(
+                f"Cannot create padding dream target for modality={modality!r}: "
+                f"dream_target.target_shapes.{modality} is not configured."
+            )
+        return torch.zeros(self.target_shapes[modality], dtype=torch.float32)
+
+    @staticmethod
+    def _is_missing_future_error(err: Exception) -> bool:
+        if isinstance(err, IndexError):
+            return True
+        msg = str(err)
+        return (
+            "marked invalid" in msg
+            or "frame pair" in msg and "invalid" in msg
+            or "out of bounds" in msg
+            or "must be indexable" in msg
+        )
+
     def build(self, sample):
         if not self.enabled:
             return None
@@ -156,23 +187,41 @@ class DreamTargetAdapter:
         dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
         episode_index = int(torch.as_tensor(sample["episode_index"]).item())
         frame_index = int(torch.as_tensor(sample["frame_index"]).item())
-        target_frame = frame_index + self.future_offset
         ds_root = self.dataset_dirs[dataset_index]
-        targets = {}
+        targets = {modality: [] for modality in self.modalities}
+        valid_mask = []
+        for offset in self.future_offsets:
+            target_frame = frame_index + int(offset)
+            is_valid = self._offset_in_episode(sample, int(offset)) and self.has_target_frames(sample, int(offset))
+            cur_targets = {}
+            if is_valid:
+                try:
+                    for modality in self.modalities:
+                        if modality == "dyn":
+                            cur_targets[modality] = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
+                        else:
+                            cur_targets[modality] = self._load_single_frame(ds_root, modality, episode_index, target_frame)
+                        self._validate_target_shape(
+                            modality=modality,
+                            tensor=cur_targets[modality],
+                            ds_root=ds_root,
+                            dataset_index=dataset_index,
+                            episode_index=episode_index,
+                            frame_index=frame_index,
+                            target_frame=target_frame,
+                        )
+                except (IndexError, ValueError) as err:
+                    if not self._is_missing_future_error(err):
+                        raise
+                    cur_targets = {}
+                    is_valid = False
+            valid_mask.append(bool(is_valid))
+            for modality in self.modalities:
+                targets[modality].append(cur_targets.get(modality, self._zero_target(modality)))
         for modality in self.modalities:
-            if modality == "dyn":
-                targets[modality] = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
-            else:
-                targets[modality] = self._load_single_frame(ds_root, modality, episode_index, target_frame)
-            self._validate_target_shape(
-                modality=modality,
-                tensor=targets[modality],
-                ds_root=ds_root,
-                dataset_index=dataset_index,
-                episode_index=episode_index,
-                frame_index=frame_index,
-                target_frame=target_frame,
-            )
+            targets[modality] = torch.stack(targets[modality], dim=0)
+        targets["future_valid_mask"] = torch.tensor(valid_mask, dtype=torch.bool)
+        targets["future_offsets"] = torch.tensor(self.future_offsets, dtype=torch.long)
         return targets
 
     def discover(self, sample) -> dict[str, dict]:

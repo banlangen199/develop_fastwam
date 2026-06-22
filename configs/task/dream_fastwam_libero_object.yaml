@@ -7,7 +7,7 @@ defaults:
 
 output_dir: ./runs/dream_fastwam_libero_object/${now:%Y-%m-%d}_${now:%H-%M-%S}
 
-batch_size: 16
+batch_size: 32
 num_workers: 4
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4

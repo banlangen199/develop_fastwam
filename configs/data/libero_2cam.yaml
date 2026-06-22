@@ -38,6 +38,7 @@ train:
     enabled: false
     mode: fixed_offset
     future_offset: 4
+    future_offsets: [4]
     max_resample_retry: 100
     modalities: ["dyn", "depth", "dino", "sam"]
     cameras: ["image", "wrist_image"]

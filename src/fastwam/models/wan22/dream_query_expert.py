@@ -189,6 +189,15 @@ class DreamQueryExpert(nn.Module):
         self.n_depth = int(dream_query.get("n_depth", legacy_kwargs.get("n_depth", 8)))
         self.n_dino = int(dream_query.get("n_dino", legacy_kwargs.get("n_dino", 8)))
         self.n_sam = int(dream_query.get("n_sam", legacy_kwargs.get("n_sam", 8)))
+        future_offsets = dream_query.get("future_offsets", dream_query.get("future_steps", None))
+        if future_offsets is None:
+            future_offsets = legacy_kwargs.get("future_offsets", [0])
+        if isinstance(future_offsets, int):
+            future_offsets = [future_offsets]
+        self.future_offsets = [int(x) for x in future_offsets]
+        if not self.future_offsets:
+            raise ValueError("dream_query.future_offsets must contain at least one offset.")
+        self.num_future_offsets = len(self.future_offsets)
 
         for name in ("hidden_dim", "ffn_dim", "num_layers", "num_heads", "attn_head_dim"):
             if int(getattr(self, name)) <= 0:
@@ -199,10 +208,18 @@ class DreamQueryExpert(nn.Module):
             if getattr(self, name) <= 0:
                 raise ValueError(f"`dream_query.{name}` must be > 0, got {getattr(self, name)}")
 
-        self.dyn_queries = nn.Parameter(torch.randn(1, self.n_dyn, self.hidden_dim) / self.hidden_dim**0.5)
-        self.depth_queries = nn.Parameter(torch.randn(1, self.n_depth, self.hidden_dim) / self.hidden_dim**0.5)
-        self.dino_queries = nn.Parameter(torch.randn(1, self.n_dino, self.hidden_dim) / self.hidden_dim**0.5)
-        self.sam_queries = nn.Parameter(torch.randn(1, self.n_sam, self.hidden_dim) / self.hidden_dim**0.5)
+        self.dyn_queries = nn.Parameter(
+            torch.randn(self.num_future_offsets, self.n_dyn, self.hidden_dim) / self.hidden_dim**0.5
+        )
+        self.depth_queries = nn.Parameter(
+            torch.randn(self.num_future_offsets, self.n_depth, self.hidden_dim) / self.hidden_dim**0.5
+        )
+        self.dino_queries = nn.Parameter(
+            torch.randn(self.num_future_offsets, self.n_dino, self.hidden_dim) / self.hidden_dim**0.5
+        )
+        self.sam_queries = nn.Parameter(
+            torch.randn(self.num_future_offsets, self.n_sam, self.hidden_dim) / self.hidden_dim**0.5
+        )
 
         self.dream_t_mod = nn.Parameter(torch.zeros(1, 6, self.hidden_dim))
         block_kwargs = dict(
@@ -285,16 +302,16 @@ class DreamQueryExpert(nn.Module):
 
     @property
     def num_dream_tokens(self) -> int:
-        return self.n_dyn + self.n_depth + self.n_dino + self.n_sam
+        return self.num_future_offsets * (self.n_dyn + self.n_depth + self.n_dino + self.n_sam)
 
     def modality_slices(self) -> dict[str, slice]:
         start = 0
         slices = {}
         for name, length in (
-            ("dyn", self.n_dyn),
-            ("depth", self.n_depth),
-            ("dino", self.n_dino),
-            ("sam", self.n_sam),
+            ("dyn", self.num_future_offsets * self.n_dyn),
+            ("depth", self.num_future_offsets * self.n_depth),
+            ("dino", self.num_future_offsets * self.n_dino),
+            ("sam", self.num_future_offsets * self.n_sam),
         ):
             end = start + length
             slices[name] = slice(start, end)
@@ -313,6 +330,8 @@ class DreamQueryExpert(nn.Module):
                 "num_heads": self.num_heads,
                 "attn_head_dim": self.attn_head_dim,
                 "num_dream_tokens": self.num_dream_tokens,
+                "future_offsets": list(self.future_offsets),
+                "num_future_offsets": self.num_future_offsets,
                 "target_num_params_m": self.target_num_params_m,
             },
             "dream_decoder": {
@@ -339,7 +358,12 @@ class DreamQueryExpert(nn.Module):
         if batch_size <= 0:
             raise ValueError(f"`batch_size` must be > 0, got {batch_size}")
         queries = torch.cat(
-            [self.dyn_queries, self.depth_queries, self.dino_queries, self.sam_queries],
+            [
+                self.dyn_queries.reshape(1, self.num_future_offsets * self.n_dyn, self.hidden_dim),
+                self.depth_queries.reshape(1, self.num_future_offsets * self.n_depth, self.hidden_dim),
+                self.dino_queries.reshape(1, self.num_future_offsets * self.n_dino, self.hidden_dim),
+                self.sam_queries.reshape(1, self.num_future_offsets * self.n_sam, self.hidden_dim),
+            ],
             dim=1,
         ).to(device=device, dtype=dtype)
         tokens = queries.expand(batch_size, -1, -1).contiguous()
@@ -353,6 +377,8 @@ class DreamQueryExpert(nn.Module):
                 "batch_size": batch_size,
                 "seq_len": self.num_dream_tokens,
                 "modality_slices": self.modality_slices(),
+                "num_future_offsets": self.num_future_offsets,
+                "future_offsets": list(self.future_offsets),
             },
         }
 
@@ -363,8 +389,17 @@ class DreamQueryExpert(nn.Module):
         if tokens.shape[1] != expected:
             raise ValueError(f"Dream token length mismatch: expected {expected}, got {tokens.shape[1]}")
         slices = pre_state["meta"]["modality_slices"]
-        return {
-            name: self.decoders[name](tokens[:, slices[name], :])
-            for name in ("dyn", "depth", "dino", "sam")
-            if bool(getattr(self.decoders[name], "enabled", True))
-        }
+        out = {}
+        for name in ("dyn", "depth", "dino", "sam"):
+            decoder = self.decoders[name]
+            if not bool(getattr(decoder, "enabled", True)):
+                continue
+            modality_tokens = tokens[:, slices[name], :]
+            bsz, _, dim = modality_tokens.shape
+            per_offset_tokens = getattr(self, f"n_{name}")
+            modality_tokens = modality_tokens.reshape(
+                bsz, self.num_future_offsets, per_offset_tokens, dim
+            )
+            decoded = decoder(modality_tokens.reshape(bsz * self.num_future_offsets, per_offset_tokens, dim))
+            out[name] = decoded.reshape(bsz, self.num_future_offsets, *decoded.shape[1:])
+        return out

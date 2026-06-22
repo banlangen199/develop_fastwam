@@ -332,13 +332,22 @@ class DreamFastWAM(FastWAM):
             targets = sample["dream_targets"]
             if not targets:
                 raise ValueError("`sample['dream_targets']` is empty; at least one modality is required.")
-            unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam"}
+            unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam", "future_valid_mask", "future_offsets"}
             if unknown:
                 raise ValueError(f"`sample['dream_targets']` contains unsupported keys: {sorted(unknown)}")
             inputs["dream_targets"] = {
                 key: value.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
                 for key, value in targets.items()
+                if key not in {"future_valid_mask", "future_offsets"}
             }
+            if "future_valid_mask" in targets:
+                inputs["future_valid_mask"] = targets["future_valid_mask"].to(
+                    device=self.device, dtype=torch.bool, non_blocking=True
+                )
+            if "future_offsets" in targets:
+                inputs["future_offsets"] = targets["future_offsets"].to(
+                    device=self.device, dtype=torch.long, non_blocking=True
+                )
         return inputs
 
     @torch.no_grad()
@@ -387,6 +396,8 @@ class DreamFastWAM(FastWAM):
         self,
         pred: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor],
+        future_valid_mask: torch.Tensor | None = None,
+        future_offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not targets:
             raise ValueError("Dream loss received no target modalities.")
@@ -396,6 +407,9 @@ class DreamFastWAM(FastWAM):
         for key, target in targets.items():
             if key not in pred:
                 raise ValueError(f"Dream decoder did not produce modality={key!r}; available={sorted(pred.keys())}")
+            if pred[key].ndim == target.ndim + 1 and pred[key].shape[1] == 1:
+                targets[key] = target.unsqueeze(1)
+                target = targets[key]
             if tuple(pred[key].shape) != tuple(target.shape):
                 raise ValueError(
                     f"Dream prediction/target shape mismatch for {key}: "
@@ -403,11 +417,43 @@ class DreamFastWAM(FastWAM):
                 )
 
         first_pred = next(iter(pred.values()))
+        batch_size = int(first_pred.shape[0])
+        num_offsets = int(first_pred.shape[1]) if first_pred.ndim >= 2 else 1
+        if future_valid_mask is None:
+            future_valid_mask = torch.ones((batch_size, num_offsets), device=first_pred.device, dtype=torch.bool)
+        else:
+            future_valid_mask = future_valid_mask.to(device=first_pred.device, dtype=torch.bool)
+            if future_valid_mask.ndim == 1:
+                future_valid_mask = future_valid_mask.unsqueeze(0).expand(batch_size, -1)
+            if tuple(future_valid_mask.shape) != (batch_size, num_offsets):
+                raise ValueError(
+                    f"future_valid_mask shape mismatch: expected {(batch_size, num_offsets)}, "
+                    f"got {tuple(future_valid_mask.shape)}"
+                )
+        valid = future_valid_mask.to(dtype=first_pred.float().dtype)
+        valid_den = valid.sum().clamp(min=1.0)
+
+        if future_offsets is None:
+            offsets = list(range(num_offsets))
+        else:
+            if future_offsets.ndim == 2:
+                future_offsets = future_offsets[0]
+            offsets = [int(x) for x in future_offsets.detach().cpu().tolist()]
+
+        def masked_mean(loss_each: torch.Tensor) -> torch.Tensor:
+            return (loss_each * valid).sum() / valid_den
+
+        def reduce_except_batch_horizon(loss: torch.Tensor) -> torch.Tensor:
+            if loss.ndim <= 2:
+                return loss
+            return loss.reshape(loss.shape[0], loss.shape[1], -1).mean(dim=-1)
+
         zero = first_pred.sum() * 0.0
         loss_dyn = zero
         loss_depth = zero
         loss_dino = zero
         loss_sam = zero
+        per_horizon_terms = []
         loss_terms = []
         if "dyn" in targets:
             dyn_min = float(targets["dyn"].detach().amin().item())
@@ -418,45 +464,70 @@ class DreamFastWAM(FastWAM):
                     dyn_min,
                     dyn_max,
                 )
-            loss_dyn = F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float())
+            loss_dyn_each = reduce_except_batch_horizon(
+                F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float(), reduction="none")
+            )
+            loss_dyn = masked_mean(loss_dyn_each)
+            per_horizon_terms.append(self.loss_lambda_dyn * loss_dyn_each)
             loss_terms.append(self.loss_lambda_dyn * loss_dyn)
         if "depth" in targets:
-            loss_depth = F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float())
+            loss_depth_each = reduce_except_batch_horizon(
+                F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float(), reduction="none")
+            )
+            loss_depth = masked_mean(loss_depth_each)
+            per_horizon_terms.append(self.loss_lambda_depth * loss_depth_each)
             loss_terms.append(self.loss_lambda_depth * loss_depth)
         if "dino" in targets:
             pred_dino = self._flatten_feature_target(pred["dino"], "dino")
             target_dino = self._flatten_feature_target(targets["dino"], "dino")
-            loss_dino = 1.0 - F.cosine_similarity(
+            loss_dino_each = 1.0 - F.cosine_similarity(
                 F.normalize(pred_dino.float(), dim=-1),
                 F.normalize(target_dino.float(), dim=-1),
                 dim=-1,
-            ).mean()
+            ).mean(dim=-1)
+            loss_dino = masked_mean(loss_dino_each)
+            per_horizon_terms.append(self.loss_lambda_dino * loss_dino_each)
             loss_terms.append(self.loss_lambda_dino * loss_dino)
         if "sam" in targets:
             pred_sam = self._flatten_feature_target(pred["sam"], "sam")
             target_sam = self._flatten_feature_target(targets["sam"], "sam")
-            loss_sam = 1.0 - F.cosine_similarity(
+            loss_sam_each = 1.0 - F.cosine_similarity(
                 F.normalize(pred_sam.float(), dim=-1),
                 F.normalize(target_sam.float(), dim=-1),
                 dim=-1,
-            ).mean()
+            ).mean(dim=-1)
+            loss_sam = masked_mean(loss_sam_each)
+            per_horizon_terms.append(self.loss_lambda_sam * loss_sam_each)
             loss_terms.append(self.loss_lambda_sam * loss_sam)
         loss_dream = sum(loss_terms)
-        return loss_dream, {
+        if per_horizon_terms:
+            loss_future_each = sum(per_horizon_terms)
+        else:
+            loss_future_each = torch.zeros_like(valid)
+        parts = {
             "loss_dyn": loss_dyn,
             "loss_depth": loss_depth,
             "loss_dino": loss_dino,
             "loss_sam": loss_sam,
+            "future_valid_ratio": valid.mean(),
         }
+        for horizon_idx, offset in enumerate(offsets[:num_offsets]):
+            horizon_valid = valid[:, horizon_idx]
+            horizon_den = horizon_valid.sum().clamp(min=1.0)
+            parts[f"future_valid_count_{offset}"] = horizon_valid.sum()
+            parts[f"loss_future_{offset}"] = (loss_future_each[:, horizon_idx] * horizon_valid).sum() / horizon_den
+        return loss_dream, parts
 
     @staticmethod
     def _flatten_feature_target(tensor: torch.Tensor, name: str) -> torch.Tensor:
-        if tensor.ndim == 3:
-            return tensor
         if tensor.ndim == 4:
-            bsz, h, w, dim = tensor.shape
-            return tensor.reshape(bsz, h * w, dim)
-        raise ValueError(f"{name} dream target must be [B,N,C] or [B,H,W,C], got {tuple(tensor.shape)}")
+            return tensor
+        if tensor.ndim == 5:
+            bsz, num_offsets, h, w, dim = tensor.shape
+            return tensor.reshape(bsz, num_offsets, h * w, dim)
+        raise ValueError(
+            f"{name} dream target must be [B,O,N,C] or [B,O,H,W,C], got {tuple(tensor.shape)}"
+        )
 
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
@@ -472,6 +543,8 @@ class DreamFastWAM(FastWAM):
                 "DreamFastWAM training requires non-empty `sample['dream_targets']`."
             )
         dream_targets = inputs["dream_targets"]
+        future_valid_mask = inputs.get("future_valid_mask", None)
+        future_offsets = inputs.get("future_offsets", None)
 
         train_video_branch = self.loss_lambda_video > 0.0
         if train_video_branch:
@@ -594,7 +667,12 @@ class DreamFastWAM(FastWAM):
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
         )
         loss_action = (action_loss_per_sample * action_weight).mean()
-        loss_dream, dream_parts = self._compute_dream_loss(pred_dream, dream_targets)
+        loss_dream, dream_parts = self._compute_dream_loss(
+            pred_dream,
+            dream_targets,
+            future_valid_mask=future_valid_mask,
+            future_offsets=future_offsets,
+        )
 
         loss_total = (
             self.loss_lambda_video * loss_video
@@ -609,7 +687,13 @@ class DreamFastWAM(FastWAM):
             "loss_depth": self.loss_lambda_dream * self.loss_lambda_depth * float(dream_parts["loss_depth"].detach().item()),
             "loss_dino": self.loss_lambda_dream * self.loss_lambda_dino * float(dream_parts["loss_dino"].detach().item()),
             "loss_sam": self.loss_lambda_dream * self.loss_lambda_sam * float(dream_parts["loss_sam"].detach().item()),
+            "future_valid_ratio": float(dream_parts["future_valid_ratio"].detach().item()),
         }
+        for key, value in dream_parts.items():
+            if key.startswith("future_valid_count_"):
+                loss_dict[key] = float(value.detach().item())
+            elif key.startswith("loss_future_"):
+                loss_dict[key] = self.loss_lambda_dream * float(value.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
