@@ -60,7 +60,7 @@ train:
       dino: [16, 16]
       sam: [16, 16]
     target_shapes:
-      dyn: [98, 1]
+      dyn: [392, 1]
       depth: [128, 256]
       dino: [16, 32, 768]
       sam: [16, 32, 256]
@@ -68,7 +68,7 @@ train:
       type: dynamic_mask
       target_layout: token_feature
       source_layout: image
-      patch_size: 4
+      patch_size: 2
     depth:
       source: depth_anything
       root: ./data/dream_modalities/depth_anything

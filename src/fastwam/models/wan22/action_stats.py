@@ -24,6 +24,13 @@ def load_action_correlation_cholesky(
     dataset_stats_path: str | Path,
     action_key: str = "default",
 ) -> torch.Tensor:
+    return load_action_correlation_stats(dataset_stats_path, action_key=action_key)["cholesky"]
+
+
+def load_action_correlation_stats(
+    dataset_stats_path: str | Path,
+    action_key: str = "default",
+) -> dict[str, Any]:
     path = Path(dataset_stats_path).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"dataset stats file not found: {path}")
@@ -35,7 +42,13 @@ def load_action_correlation_cholesky(
             "Correlated action noise is enabled but dataset stats do not contain "
             f"'action.{action_key}.action_correlation_cholesky'. Regenerate dataset_stats.json with the new stats code."
         )
-    return torch.as_tensor(action_stats["action_correlation_cholesky"], dtype=torch.float32)
+    return {
+        "cholesky": torch.as_tensor(action_stats["action_correlation_cholesky"], dtype=torch.float32),
+        "correlation_beta": action_stats.get("action_correlation_beta"),
+        "jitter": action_stats.get("action_correlation_jitter"),
+        "action_horizon": action_stats.get("action_horizon"),
+        "action_dim": action_stats.get("action_dim"),
+    }
 
 
 def validate_action_correlation_cholesky(chol: torch.Tensor, horizon: int, action_dim: int) -> None:

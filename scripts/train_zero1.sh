@@ -113,5 +113,5 @@ accelerate launch \
   --num_processes "${NPROC_PER_NODE}" \
   scripts/train.py \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
-  "wandb.name=${TASK_BASENAME}" \
+  "wandb.name=${TASK_BASENAME}_${RUN_ID}" \
   "${EXTRA_ARGS[@]}"

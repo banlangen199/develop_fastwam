@@ -86,8 +86,8 @@ class DreamTargetAdapter:
         if self.enabled:
             if self.mode != "fixed_offset":
                 raise ValueError(f"Unsupported dream_target.mode={self.mode!r}; only 'fixed_offset' is implemented.")
-            if any(offset <= 0 for offset in self.future_offsets):
-                raise ValueError(f"dream_target.future_offsets must be > 0, got {self.future_offsets}")
+            if any(offset < 0 for offset in self.future_offsets):
+                raise ValueError(f"dream_target.future_offsets must be >= 0, got {self.future_offsets}")
             unknown = set(self.modalities) - self.MODALITIES
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
@@ -141,14 +141,14 @@ class DreamTargetAdapter:
         path = Path(path)
         cache_key = str(path)
         if cache_key not in self._frame_index_cache:
-            if not path.exists():
+            if not self._extra_file_exists(path):
                 self._frame_index_cache[cache_key] = None
             else:
-                with np.load(path) as payload:
-                    if "frame_index" in payload.files:
-                        self._frame_index_cache[cache_key] = set(int(x) for x in payload["frame_index"].tolist())
-                    else:
-                        self._frame_index_cache[cache_key] = True
+                frame_indices = self._load_extra_array(path, "frame_index", required=False)
+                if frame_indices is not None:
+                    self._frame_index_cache[cache_key] = set(int(x) for x in frame_indices.tolist())
+                else:
+                    self._frame_index_cache[cache_key] = True
         available = self._frame_index_cache[cache_key]
         if available is True:
             return True
@@ -243,20 +243,24 @@ class DreamTargetAdapter:
                 per_cam = []
                 for camera in self.cameras:
                     path = self._npz_path(ds_root, "dyn", camera, episode_index)
-                    with np.load(path) as payload:
-                        tracks = payload["tracks"]
-                        start_row = self._frame_row(payload, path, frame_index)
-                        target_row = self._frame_row(payload, path, target_frame)
-                        delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
-                        motion = delta.norm(dim=-1, keepdim=True)
-                        if "visibility" in payload.files:
-                            motion = motion * torch.as_tensor(payload["visibility"][target_row]).float().reshape(-1, 1)
-                        motion = (motion / motion.max().clamp(min=1e-6)).clamp(0.0, 1.0)
-                        per_cam.append((motion, str(path)))
+                    tracks = self._load_extra_array(path, "tracks")
+                    start_row = self._frame_row_from_path(path, frame_index)
+                    target_row = self._frame_row_from_path(path, target_frame)
+                    delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
+                    motion = delta.norm(dim=-1, keepdim=True)
+                    visibility = self._load_extra_array(path, "visibility", required=False)
+                    if visibility is not None:
+                        motion = motion * torch.as_tensor(visibility[target_row]).float().reshape(-1, 1)
+                    motion = (motion / motion.max().clamp(min=1e-6)).clamp(0.0, 1.0)
+                    per_cam.append((motion, str(path)))
             else:
                 per_cam = [
                     (
-                        self._load_npz_array(self._npz_path(ds_root, modality, camera, episode_index), modality, target_frame),
+                        self._load_extra_frame_array(
+                            self._npz_path(ds_root, modality, camera, episode_index),
+                            modality,
+                            target_frame,
+                        ),
                         str(self._npz_path(ds_root, modality, camera, episode_index)),
                     )
                     for camera in self.cameras
@@ -306,6 +310,16 @@ class DreamTargetAdapter:
         if "frame_index" not in payload.files:
             return frame_index
         frame_indices = payload["frame_index"]
+        return self._frame_row_from_indices(frame_indices, path, frame_index)
+
+    def _frame_row_from_path(self, path: Path, frame_index: int) -> int:
+        frame_indices = self._load_extra_array(path, "frame_index", required=False)
+        if frame_indices is None:
+            return frame_index
+        return self._frame_row_from_indices(frame_indices, path, frame_index)
+
+    @staticmethod
+    def _frame_row_from_indices(frame_indices, path: Path, frame_index: int) -> int:
         matches = np.nonzero(frame_indices == frame_index)[0]
         if len(matches) != 1:
             raise IndexError(
@@ -313,8 +327,62 @@ class DreamTargetAdapter:
             )
         return int(matches[0])
 
+    @staticmethod
+    def _npy_sidecar_path(path: Path, key: str) -> Path:
+        return Path(path).with_suffix(f".{key}.npy")
+
+    @staticmethod
+    def _extra_file_exists(path: Path) -> bool:
+        path = Path(path)
+        if path.exists():
+            return True
+        return any(path.parent.glob(f"{path.stem}.*.npy"))
+
+    def _extra_has_key(self, path: Path, key: str) -> bool:
+        sidecar = self._npy_sidecar_path(path, key)
+        if sidecar.exists():
+            return True
+        if not self._extra_file_exists(path):
+            return False
+        if not Path(path).exists():
+            return False
+        with np.load(path) as payload:
+            return key in payload.files
+
+    def _load_extra_array(self, path: Path, key: str, *, required: bool = True):
+        sidecar = self._npy_sidecar_path(path, key)
+        if sidecar.exists():
+            return np.load(sidecar, mmap_mode="r")
+        if not self._extra_file_exists(path):
+            if required:
+                raise FileNotFoundError(f"Missing dream target data: {path}")
+            return None
+        if not Path(path).exists():
+            if required:
+                raise KeyError(f"{path} sidecars exist, but key {key!r} sidecar is missing.")
+            return None
+        with np.load(path) as payload:
+            if key not in payload.files:
+                if required:
+                    raise KeyError(f"{path} does not contain key {key!r}; available keys={payload.files}.")
+                return None
+            return np.asarray(payload[key])
+
+    def _load_extra_frame_array(self, path: Path, modality: str, frame_index: int) -> torch.Tensor:
+        key = self.array_keys.get(modality, modality)
+        arr = self._load_extra_array(path, key)
+        row = self._frame_row_from_path(path, frame_index)
+        if row >= arr.shape[0]:
+            raise IndexError(
+                f"Dream target row {row} for frame {frame_index} out of bounds for {path}: first dimension={arr.shape[0]}"
+            )
+        valid = self._load_extra_array(path, "valid", required=False)
+        if valid is not None and not bool(valid[row]):
+            raise ValueError(f"Dream target frame {frame_index} is marked invalid in {path}.")
+        return torch.as_tensor(arr[row]).float()
+
     def _load_npz_array(self, path: Path, modality: str, frame_index: int) -> torch.Tensor:
-        if not path.exists():
+        if not self._extra_file_exists(path):
             if modality == "depth" and self.modality_configs.get("depth", {}).get("root"):
                 raise FileNotFoundError(
                     f"Missing Depth Anything dream target: {path}. "
@@ -324,19 +392,7 @@ class DreamTargetAdapter:
                 f"Missing dream target data for modality={modality!r}: {path}. "
                 "Run the corresponding preprocessing job or disable/remove this modality in dream_target.modalities."
             )
-        with np.load(path) as payload:
-            key = self.array_keys.get(modality, modality)
-            if key not in payload.files:
-                raise KeyError(f"{path} does not contain key {key!r}; available keys={payload.files}.")
-            arr = payload[key]
-            row = self._frame_row(payload, path, frame_index)
-            if row >= arr.shape[0]:
-                raise IndexError(
-                    f"Dream target row {row} for frame {frame_index} out of bounds for {path}: first dimension={arr.shape[0]}"
-                )
-            if "valid" in payload.files and not bool(payload["valid"][row]):
-                raise ValueError(f"Dream target frame {frame_index} is marked invalid in {path}.")
-            return torch.as_tensor(arr[row]).float()
+        return self._load_extra_frame_array(path, modality, frame_index)
 
     def _load_single_frame(self, ds_root: Path, modality: str, episode_index: int, target_frame: int) -> torch.Tensor:
         tensors = [
@@ -349,43 +405,44 @@ class DreamTargetAdapter:
         dyn_tensors = []
         for camera in self.cameras:
             path = self._npz_path(ds_root, "dyn", camera, episode_index)
-            if not path.exists():
+            if not self._extra_file_exists(path):
                 raise FileNotFoundError(
                     f"Missing CoTracker dynamic dream target data: {path}. "
                     "Expected extras/cotracker/{image,wrist_image}/episode_XXXXXX.npz with tracks/visibility."
                 )
-            with np.load(path) as payload:
-                if "tracks" in payload.files:
-                    tracks = payload["tracks"]
-                    start_row = self._frame_row(payload, path, frame_index)
-                    target_row = self._frame_row(payload, path, target_frame)
-                    if "valid" in payload.files and (
-                        not bool(payload["valid"][start_row]) or not bool(payload["valid"][target_row])
+            if self._extra_has_key(path, "tracks"):
+                tracks = self._load_extra_array(path, "tracks")
+                start_row = self._frame_row_from_path(path, frame_index)
+                target_row = self._frame_row_from_path(path, target_frame)
+                valid = self._load_extra_array(path, "valid", required=False)
+                if valid is not None and (
+                        not bool(valid[start_row]) or not bool(valid[target_row])
                     ):
-                        raise ValueError(f"CoTracker frame pair {frame_index}->{target_frame} is invalid in {path}.")
-                    if tracks.ndim != 3 or tracks.shape[-1] != 2:
-                        raise ValueError(f"{path} key 'tracks' must have shape [T, N, 2], got {tracks.shape}.")
-                    delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
-                    motion = delta.norm(dim=-1, keepdim=True)
-                    if "visibility" in payload.files:
-                        vis = torch.as_tensor(payload["visibility"][target_row]).float().reshape(-1, 1)
-                        motion = motion * vis
-                    max_motion = motion.max().clamp(min=1e-6)
-                    motion = (motion / max_motion).clamp(0.0, 1.0)
-                    dyn_tensors.append(motion)
-                elif "dyn" in payload.files:
-                    arr = payload["dyn"]
-                    if arr.ndim < 2 or target_frame >= arr.shape[1]:
-                        raise ValueError(
-                            f"{path} key 'dyn' must be indexable as [start_frame, end_frame, ...] "
-                            f"for pair {frame_index}->{target_frame}, got shape {arr.shape}."
-                        )
-                    dyn_tensors.append(torch.as_tensor(arr[frame_index, target_frame]).float())
-                else:
+                    raise ValueError(f"CoTracker frame pair {frame_index}->{target_frame} is invalid in {path}.")
+                if tracks.ndim != 3 or tracks.shape[-1] != 2:
+                    raise ValueError(f"{path} key 'tracks' must have shape [T, N, 2], got {tracks.shape}.")
+                delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
+                motion = delta.norm(dim=-1, keepdim=True)
+                visibility = self._load_extra_array(path, "visibility", required=False)
+                if visibility is not None:
+                    vis = torch.as_tensor(visibility[target_row]).float().reshape(-1, 1)
+                    motion = motion * vis
+                max_motion = motion.max().clamp(min=1e-6)
+                motion = (motion / max_motion).clamp(0.0, 1.0)
+                dyn_tensors.append(motion)
+            elif self._extra_has_key(path, "dyn"):
+                arr = self._load_extra_array(path, "dyn")
+                if arr.ndim < 2 or target_frame >= arr.shape[1]:
                     raise ValueError(
-                        f"{path} must contain CoTracker keys 'tracks'/'visibility' or dense key 'dyn' "
-                        "for t->t+future_offset labels."
+                        f"{path} key 'dyn' must be indexable as [start_frame, end_frame, ...] "
+                        f"for pair {frame_index}->{target_frame}, got shape {arr.shape}."
                     )
+                dyn_tensors.append(torch.as_tensor(arr[frame_index, target_frame]).float())
+            else:
+                raise ValueError(
+                    f"{path} must contain CoTracker keys 'tracks'/'visibility' or dense key 'dyn' "
+                    "for t->t+future_offset labels."
+                )
         return self._concat_camera_targets(dyn_tensors[0], dyn_tensors[1], "dyn")
 
     def _source_paths(self, ds_root: Path, modality: str, episode_index: int) -> list[str]:

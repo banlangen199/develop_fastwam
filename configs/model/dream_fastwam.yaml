@@ -98,8 +98,8 @@ dream_query_config:
       type: dynamic_mask
       target_layout: token_feature
       source_layout: image
-      patch_size: 4
-      target_shape: [98, 1]
+      patch_size: 2
+      target_shape: [392, 1]
 
 video_scheduler:
   train_shift: 5.0

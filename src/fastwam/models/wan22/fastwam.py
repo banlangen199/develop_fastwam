@@ -8,7 +8,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
-from .action_stats import load_action_correlation_cholesky, sample_action_noise_like
+from .action_stats import load_action_correlation_stats, sample_action_noise_like
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -100,14 +100,33 @@ class FastWAM(torch.nn.Module):
         self.to(self.device)
 
     def load_action_noise_stats(self, dataset_stats_path: str, action_key: str = "default") -> None:
-        chol = load_action_correlation_cholesky(dataset_stats_path, action_key=action_key)
+        loaded = load_action_correlation_stats(dataset_stats_path, action_key=action_key)
+        chol = loaded["cholesky"]
+        stats_beta = loaded.get("correlation_beta")
+        stats_jitter = loaded.get("jitter")
+        if stats_beta is not None and abs(float(stats_beta) - self.action_noise_correlation_beta) > 1e-8:
+            raise ValueError(
+                "model.action_noise.correlation_beta does not match dataset stats: "
+                f"config={self.action_noise_correlation_beta}, stats={float(stats_beta)}. "
+                "Regenerate dataset_stats.json with the desired action_stats_correlation_beta, "
+                "or set model.action_noise.correlation_beta to the stats value."
+            )
+        if stats_jitter is not None and abs(float(stats_jitter) - self.action_noise_jitter) > 1e-12:
+            raise ValueError(
+                "model.action_noise.jitter does not match dataset stats: "
+                f"config={self.action_noise_jitter}, stats={float(stats_jitter)}. "
+                "Regenerate dataset_stats.json with the desired action_stats_correlation_jitter, "
+                "or set model.action_noise.jitter to the stats value."
+            )
         self.action_correlation_cholesky = chol.to(device=self.device, dtype=torch.float32)
         self.action_noise_stats_path = str(dataset_stats_path)
         self.action_noise_action_key = str(action_key)
         logger.info(
-            "Loaded action_correlation_cholesky from %s with shape %s",
+            "Loaded action_correlation_cholesky from %s with shape %s beta=%s jitter=%s",
             dataset_stats_path,
             tuple(chol.shape),
+            stats_beta,
+            stats_jitter,
         )
 
     def _sample_action_noise(self, action: torch.Tensor, *, use_correlated_noise: bool, generator=None) -> torch.Tensor:

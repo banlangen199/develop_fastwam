@@ -32,43 +32,59 @@ class LinearNormalizer:
 
         for meta in shape_meta["action"]:
             key = meta["key"]
-            
-            if use_stepwise_action_norm:
-                action_stats = stats["action"][key]
-                if "action_mean_timestep" in action_stats and "action_std_timestep" in action_stats:
-                    cur_stats = {
-                        "mean": action_stats["action_mean_timestep"],
-                        "std": action_stats["action_std_timestep"].clamp_min(1e-6),
-                    }
-                elif "stepwise_mean" in action_stats and "stepwise_std" in action_stats:
-                    cur_stats = {
-                        "mean": action_stats["stepwise_mean"],
-                        "std": action_stats["stepwise_std"].clamp_min(1e-6),
-                    }
-                elif strict_stepwise_action_stats:
-                    raise ValueError(
-                        f"use_per_timestep_norm/use_stepwise_action_norm is enabled for action {key!r}, "
-                        "but dataset stats do not contain action_mean_timestep/action_std_timestep "
-                        "or stepwise_mean/stepwise_std."
-                    )
-                else:
-                    logger.warning(
-                        "use_per_timestep_norm/use_stepwise_action_norm is enabled for action %r, "
-                        "but per-timestep mean/std stats are missing. Falling back to global mean/std stats.",
-                        key,
-                    )
-                    cur_stats = {
-                        "mean": action_stats["global_mean"],
-                        "std": action_stats["global_std"].clamp_min(1e-6),
-                    }
-                cur_mode = "z-score"
-            else:
-                cur_stats = {k.removeprefix("global_"): v for k, v in stats["action"][key].items() if k.startswith("global_")}
+            action_stats = stats["action"][key]
 
-                if exception_mode is not None and "action" in exception_mode and key in exception_mode["action"]:
-                    cur_mode = exception_mode["action"][key]
-                else:
-                    cur_mode = default_mode
+            if exception_mode is not None and "action" in exception_mode and key in exception_mode["action"]:
+                cur_mode = exception_mode["action"][key]
+            else:
+                cur_mode = default_mode
+
+            def global_action_stats() -> Dict[str, torch.Tensor]:
+                return {k.removeprefix("global_"): v for k, v in action_stats.items() if k.startswith("global_")}
+
+            def stepwise_action_stats_for_mode(mode: NormMode) -> Dict[str, torch.Tensor] | None:
+                if mode == "z-score":
+                    if "action_mean_timestep" in action_stats and "action_std_timestep" in action_stats:
+                        return {
+                            "mean": action_stats["action_mean_timestep"],
+                            "std": action_stats["action_std_timestep"].clamp_min(1e-6),
+                        }
+                    if "stepwise_mean" in action_stats and "stepwise_std" in action_stats:
+                        return {
+                            "mean": action_stats["stepwise_mean"],
+                            "std": action_stats["stepwise_std"].clamp_min(1e-6),
+                        }
+                    return None
+                if mode == "min/max":
+                    if "stepwise_min" in action_stats and "stepwise_max" in action_stats:
+                        return {"min": action_stats["stepwise_min"], "max": action_stats["stepwise_max"]}
+                    return None
+                if mode == "q01/q99":
+                    if "stepwise_q01" in action_stats and "stepwise_q99" in action_stats:
+                        return {"q01": action_stats["stepwise_q01"], "q99": action_stats["stepwise_q99"]}
+                    return None
+                if "stepwise_min" in action_stats and "stepwise_max" in action_stats:
+                    return {"min": action_stats["stepwise_min"], "max": action_stats["stepwise_max"]}
+                return None
+
+            if use_stepwise_action_norm:
+                cur_stats = stepwise_action_stats_for_mode(cur_mode)
+                if cur_stats is None:
+                    if strict_stepwise_action_stats:
+                        raise ValueError(
+                            f"use_per_timestep_norm/use_stepwise_action_norm is enabled for action {key!r} "
+                            f"with mode {cur_mode!r}, but matching stepwise stats are missing."
+                        )
+                    logger.warning(
+                        "use_per_timestep_norm/use_stepwise_action_norm is enabled for action %r "
+                        "with mode %r, but matching stepwise stats are missing. "
+                        "Falling back to global stats with the same mode.",
+                        key,
+                        cur_mode,
+                    )
+                    cur_stats = global_action_stats()
+            else:
+                cur_stats = global_action_stats()
 
             self.normalizers["action"][key] = SingleFieldLinearNormalizer(
                 stats=cur_stats, 
