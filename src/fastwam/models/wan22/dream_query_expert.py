@@ -221,6 +221,11 @@ class DreamQueryExpert(nn.Module):
             torch.randn(self.num_future_offsets, self.n_sam, self.hidden_dim) / self.hidden_dim**0.5
         )
 
+        self.text_embedding = nn.Sequential(
+            nn.Linear(self.text_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
         self.dream_t_mod = nn.Parameter(torch.zeros(1, 6, self.hidden_dim))
         block_kwargs = dict(
             hidden_dim=self.hidden_dim,
@@ -354,7 +359,14 @@ class DreamQueryExpert(nn.Module):
     def resolved_architecture(self) -> dict[str, Any]:
         return self.architecture
 
-    def pre_dit(self, batch_size: int, device: torch.device | str, dtype: torch.dtype) -> Dict[str, Any]:
+    def pre_dit(
+        self,
+        batch_size: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> Dict[str, Any]:
         if batch_size <= 0:
             raise ValueError(f"`batch_size` must be > 0, got {batch_size}")
         queries = torch.cat(
@@ -369,7 +381,7 @@ class DreamQueryExpert(nn.Module):
         tokens = queries.expand(batch_size, -1, -1).contiguous()
         freqs = self.freqs[: self.num_dream_tokens].view(self.num_dream_tokens, 1, -1).to(tokens.device)
         t_mod = self.dream_t_mod.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
-        return {
+        pre_state = {
             "tokens": tokens,
             "freqs": freqs,
             "t_mod": t_mod,
@@ -381,6 +393,31 @@ class DreamQueryExpert(nn.Module):
                 "future_offsets": list(self.future_offsets),
             },
         }
+        if context is not None:
+            if context.ndim != 3:
+                raise ValueError(f"`context` must be 3D [B,L,D], got shape {tuple(context.shape)}")
+            if context.shape[0] != batch_size:
+                raise ValueError(
+                    f"Batch mismatch between dream tokens and text context: {batch_size} vs {context.shape[0]}"
+                )
+            if context_mask is None:
+                context_mask = torch.ones((batch_size, context.shape[1]), dtype=torch.bool, device=context.device)
+            else:
+                if context_mask.ndim != 2:
+                    raise ValueError(f"`context_mask` must be 2D [B,L], got shape {tuple(context_mask.shape)}")
+                if context_mask.shape[0] != batch_size or context_mask.shape[1] != context.shape[1]:
+                    raise ValueError(
+                        f"`context_mask` shape must match `context` shape [B,L], "
+                        f"got {tuple(context_mask.shape)} vs {tuple(context.shape)}"
+                    )
+            context = context.to(device=device, dtype=dtype)
+            context_mask = context_mask.to(device=device, dtype=torch.bool)
+            pre_state["context"] = self.text_embedding(context)
+            pre_state["context_mask"] = context_mask.unsqueeze(1).expand(-1, self.num_dream_tokens, -1)
+        else:
+            pre_state["context"] = None
+            pre_state["context_mask"] = None
+        return pre_state
 
     def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> dict[str, torch.Tensor]:
         if tokens.ndim != 3:

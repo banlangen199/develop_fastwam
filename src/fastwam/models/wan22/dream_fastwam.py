@@ -594,6 +594,8 @@ class DreamFastWAM(FastWAM):
             batch_size=batch_size,
             device=video_pre["tokens"].device,
             dtype=video_pre["tokens"].dtype,
+            context=context,
+            context_mask=context_mask,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=noisy_action,
@@ -623,7 +625,7 @@ class DreamFastWAM(FastWAM):
             },
             context_all={
                 "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                "dream": None,
+                "dream": {"context": dream_pre["context"], "mask": dream_pre["context_mask"]},
                 "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
             },
             t_mod_all={
@@ -721,6 +723,8 @@ class DreamFastWAM(FastWAM):
             batch_size=latents_video.shape[0],
             device=video_pre["tokens"].device,
             dtype=video_pre["tokens"].dtype,
+            context=context,
+            context_mask=context_mask,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
@@ -740,7 +744,7 @@ class DreamFastWAM(FastWAM):
             freqs_all={"video": video_pre["freqs"], "dream": dream_pre["freqs"], "action": action_pre["freqs"]},
             context_all={
                 "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
-                "dream": None,
+                "dream": {"context": dream_pre["context"], "mask": dream_pre["context_mask"]},
                 "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
             },
             t_mod_all={"video": video_pre["t_mod"], "dream": dream_pre["t_mod"], "action": action_pre["t_mod"]},
