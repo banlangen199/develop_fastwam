@@ -10,9 +10,11 @@ train:
   dream_target:
     enabled: true
     mode: fixed_offset
-    future_offset: 32
-    future_offsets: [4]
+    future_offset: 0
+    future_offsets: [0]
     modalities: ["dyn", "depth", "dino", "sam"]
+    dyn:
+      motion_offset: 4
     depth:
       source: depth_anything
       root: ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot/extras/depth_anything_v3_metric

@@ -63,6 +63,8 @@ class DreamTargetAdapter:
         self.max_resample_retry = int(cfg.get("max_resample_retry", 100))
         self.modalities = list(cfg.get("modalities", ["dyn", "depth", "dino", "sam"]))
         self.modality_configs = {name: dict(cfg.get(name, {}) or {}) for name in self.MODALITIES}
+        dyn_motion_offset = self.modality_configs.get("dyn", {}).get("motion_offset", None)
+        self.dyn_motion_offset = None if dyn_motion_offset is None else int(dyn_motion_offset)
         cameras = cfg.get("cameras", cfg.get("camera", ["image", "wrist_image"]))
         if isinstance(cameras, str):
             cameras = [cameras]
@@ -88,6 +90,8 @@ class DreamTargetAdapter:
                 raise ValueError(f"Unsupported dream_target.mode={self.mode!r}; only 'fixed_offset' is implemented.")
             if any(offset < 0 for offset in self.future_offsets):
                 raise ValueError(f"dream_target.future_offsets must be >= 0, got {self.future_offsets}")
+            if self.dyn_motion_offset is not None and self.dyn_motion_offset < 0:
+                raise ValueError(f"dream_target.dyn.motion_offset must be >= 0, got {self.dyn_motion_offset}")
             unknown = set(self.modalities) - self.MODALITIES
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
@@ -121,21 +125,30 @@ class DreamTargetAdapter:
     def has_target_frames(self, sample, offset: int) -> bool:
         if not self.enabled:
             return True
+        return all(self.has_modality_target_frames(sample, modality, offset) for modality in self.modalities)
+
+    def has_modality_target_frames(self, sample, modality: str, offset: int) -> bool:
+        if not self.enabled:
+            return True
         if "dataset_index" not in sample or "episode_index" not in sample or "frame_index" not in sample:
             return False
         dataset_index = int(torch.as_tensor(sample["dataset_index"]).item())
         episode_index = int(torch.as_tensor(sample["episode_index"]).item())
         frame_index = int(torch.as_tensor(sample["frame_index"]).item())
-        target_frame = frame_index + int(offset)
+        target_frame = frame_index + self._target_offset_for_modality(modality, int(offset))
         ds_root = self.dataset_dirs[dataset_index]
-        for modality in self.modalities:
-            frames = (frame_index, target_frame) if modality == "dyn" else (target_frame,)
-            for camera in self.cameras:
-                path = self._npz_path(ds_root, modality, camera, episode_index)
-                for required_frame in frames:
-                    if not self._npz_has_frame(path, required_frame):
-                        return False
+        frames = (frame_index, target_frame) if modality == "dyn" else (target_frame,)
+        for camera in self.cameras:
+            path = self._npz_path(ds_root, modality, camera, episode_index)
+            for required_frame in frames:
+                if not self._npz_has_frame(path, required_frame):
+                    return False
         return True
+
+    def _target_offset_for_modality(self, modality: str, offset: int) -> int:
+        if modality == "dyn" and self.dyn_motion_offset is not None:
+            return self.dyn_motion_offset
+        return int(offset)
 
     def _npz_has_frame(self, path: Path, frame_index: int) -> bool:
         path = Path(path)
@@ -189,38 +202,54 @@ class DreamTargetAdapter:
         frame_index = int(torch.as_tensor(sample["frame_index"]).item())
         ds_root = self.dataset_dirs[dataset_index]
         targets = {modality: [] for modality in self.modalities}
-        valid_mask = []
+        modality_valid_masks = {modality: [] for modality in self.modalities}
         for offset in self.future_offsets:
-            target_frame = frame_index + int(offset)
-            is_valid = self._offset_in_episode(sample, int(offset)) and self.has_target_frames(sample, int(offset))
             cur_targets = {}
-            if is_valid:
+            for modality in self.modalities:
+                modality_offset = self._target_offset_for_modality(modality, int(offset))
+                target_frame = frame_index + modality_offset
+                is_valid = (
+                    self._offset_in_episode(sample, modality_offset)
+                    and self.has_modality_target_frames(sample, modality, int(offset))
+                )
+                if not is_valid:
+                    modality_valid_masks[modality].append(False)
+                    targets[modality].append(self._zero_target(modality))
+                    continue
                 try:
-                    for modality in self.modalities:
-                        if modality == "dyn":
-                            cur_targets[modality] = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
-                        else:
-                            cur_targets[modality] = self._load_single_frame(ds_root, modality, episode_index, target_frame)
-                        self._validate_target_shape(
-                            modality=modality,
-                            tensor=cur_targets[modality],
-                            ds_root=ds_root,
-                            dataset_index=dataset_index,
-                            episode_index=episode_index,
-                            frame_index=frame_index,
-                            target_frame=target_frame,
-                        )
+                    if modality == "dyn":
+                        cur_target = self._load_dyn(ds_root, episode_index, frame_index, target_frame)
+                    else:
+                        cur_target = self._load_single_frame(ds_root, modality, episode_index, target_frame)
+                    self._validate_target_shape(
+                        modality=modality,
+                        tensor=cur_target,
+                        ds_root=ds_root,
+                        dataset_index=dataset_index,
+                        episode_index=episode_index,
+                        frame_index=frame_index,
+                        target_frame=target_frame,
+                    )
                 except (IndexError, ValueError) as err:
                     if not self._is_missing_future_error(err):
                         raise
-                    cur_targets = {}
-                    is_valid = False
-            valid_mask.append(bool(is_valid))
-            for modality in self.modalities:
-                targets[modality].append(cur_targets.get(modality, self._zero_target(modality)))
+                    modality_valid_masks[modality].append(False)
+                    targets[modality].append(self._zero_target(modality))
+                    continue
+                cur_targets[modality] = cur_target
+                modality_valid_masks[modality].append(True)
+                targets[modality].append(cur_target)
         for modality in self.modalities:
             targets[modality] = torch.stack(targets[modality], dim=0)
-        targets["future_valid_mask"] = torch.tensor(valid_mask, dtype=torch.bool)
+            targets[f"{modality}_valid_mask"] = torch.tensor(modality_valid_masks[modality], dtype=torch.bool)
+        if modality_valid_masks:
+            valid_stack = torch.stack(
+                [targets[f"{modality}_valid_mask"] for modality in self.modalities],
+                dim=0,
+            )
+            targets["future_valid_mask"] = valid_stack.all(dim=0)
+        else:
+            targets["future_valid_mask"] = torch.ones(len(self.future_offsets), dtype=torch.bool)
         targets["future_offsets"] = torch.tensor(self.future_offsets, dtype=torch.long)
         return targets
 

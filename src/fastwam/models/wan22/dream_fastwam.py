@@ -332,18 +332,29 @@ class DreamFastWAM(FastWAM):
             targets = sample["dream_targets"]
             if not targets:
                 raise ValueError("`sample['dream_targets']` is empty; at least one modality is required.")
-            unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam", "future_valid_mask", "future_offsets"}
+            mask_keys = {f"{name}_valid_mask" for name in ("dyn", "depth", "dino", "sam")}
+            metadata_keys = {"future_valid_mask", "future_offsets", *mask_keys}
+            unknown = set(targets.keys()) - {"dyn", "depth", "dino", "sam", *metadata_keys}
             if unknown:
                 raise ValueError(f"`sample['dream_targets']` contains unsupported keys: {sorted(unknown)}")
             inputs["dream_targets"] = {
                 key: value.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
                 for key, value in targets.items()
-                if key not in {"future_valid_mask", "future_offsets"}
+                if key not in metadata_keys
             }
             if "future_valid_mask" in targets:
                 inputs["future_valid_mask"] = targets["future_valid_mask"].to(
                     device=self.device, dtype=torch.bool, non_blocking=True
                 )
+            modality_valid_masks = {}
+            for name in ("dyn", "depth", "dino", "sam"):
+                key = f"{name}_valid_mask"
+                if key in targets:
+                    modality_valid_masks[name] = targets[key].to(
+                        device=self.device, dtype=torch.bool, non_blocking=True
+                    )
+            if modality_valid_masks:
+                inputs["modality_valid_masks"] = modality_valid_masks
             if "future_offsets" in targets:
                 inputs["future_offsets"] = targets["future_offsets"].to(
                     device=self.device, dtype=torch.long, non_blocking=True
@@ -397,6 +408,7 @@ class DreamFastWAM(FastWAM):
         pred: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor],
         future_valid_mask: torch.Tensor | None = None,
+        modality_valid_masks: dict[str, torch.Tensor] | None = None,
         future_offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not targets:
@@ -431,7 +443,25 @@ class DreamFastWAM(FastWAM):
                     f"got {tuple(future_valid_mask.shape)}"
                 )
         valid = future_valid_mask.to(dtype=first_pred.float().dtype)
-        valid_den = valid.sum().clamp(min=1.0)
+
+        def normalize_valid_mask(mask: torch.Tensor | None, name: str) -> torch.Tensor:
+            if mask is None:
+                return valid
+            mask = mask.to(device=first_pred.device, dtype=torch.bool)
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0).expand(batch_size, -1)
+            if tuple(mask.shape) != (batch_size, num_offsets):
+                raise ValueError(
+                    f"{name}_valid_mask shape mismatch: expected {(batch_size, num_offsets)}, "
+                    f"got {tuple(mask.shape)}"
+                )
+            return mask.to(dtype=first_pred.float().dtype)
+
+        modality_valid_masks = modality_valid_masks or {}
+        valid_by_modality = {
+            name: normalize_valid_mask(modality_valid_masks.get(name), name)
+            for name in ("dyn", "depth", "dino", "sam")
+        }
 
         if future_offsets is None:
             offsets = list(range(num_offsets))
@@ -440,8 +470,9 @@ class DreamFastWAM(FastWAM):
                 future_offsets = future_offsets[0]
             offsets = [int(x) for x in future_offsets.detach().cpu().tolist()]
 
-        def masked_mean(loss_each: torch.Tensor) -> torch.Tensor:
-            return (loss_each * valid).sum() / valid_den
+        def masked_mean(loss_each: torch.Tensor, modality: str) -> torch.Tensor:
+            modality_valid = valid_by_modality[modality]
+            return (loss_each * modality_valid).sum() / modality_valid.sum().clamp(min=1.0)
 
         def reduce_except_batch_horizon(loss: torch.Tensor) -> torch.Tensor:
             if loss.ndim <= 2:
@@ -467,15 +498,15 @@ class DreamFastWAM(FastWAM):
             loss_dyn_each = reduce_except_batch_horizon(
                 F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float(), reduction="none")
             )
-            loss_dyn = masked_mean(loss_dyn_each)
-            per_horizon_terms.append(self.loss_lambda_dyn * loss_dyn_each)
+            loss_dyn = masked_mean(loss_dyn_each, "dyn")
+            per_horizon_terms.append((self.loss_lambda_dyn * loss_dyn_each, valid_by_modality["dyn"]))
             loss_terms.append(self.loss_lambda_dyn * loss_dyn)
         if "depth" in targets:
             loss_depth_each = reduce_except_batch_horizon(
                 F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float(), reduction="none")
             )
-            loss_depth = masked_mean(loss_depth_each)
-            per_horizon_terms.append(self.loss_lambda_depth * loss_depth_each)
+            loss_depth = masked_mean(loss_depth_each, "depth")
+            per_horizon_terms.append((self.loss_lambda_depth * loss_depth_each, valid_by_modality["depth"]))
             loss_terms.append(self.loss_lambda_depth * loss_depth)
         if "dino" in targets:
             pred_dino = self._flatten_feature_target(pred["dino"], "dino")
@@ -485,8 +516,8 @@ class DreamFastWAM(FastWAM):
                 F.normalize(target_dino.float(), dim=-1),
                 dim=-1,
             ).mean(dim=-1)
-            loss_dino = masked_mean(loss_dino_each)
-            per_horizon_terms.append(self.loss_lambda_dino * loss_dino_each)
+            loss_dino = masked_mean(loss_dino_each, "dino")
+            per_horizon_terms.append((self.loss_lambda_dino * loss_dino_each, valid_by_modality["dino"]))
             loss_terms.append(self.loss_lambda_dino * loss_dino)
         if "sam" in targets:
             pred_sam = self._flatten_feature_target(pred["sam"], "sam")
@@ -496,14 +527,20 @@ class DreamFastWAM(FastWAM):
                 F.normalize(target_sam.float(), dim=-1),
                 dim=-1,
             ).mean(dim=-1)
-            loss_sam = masked_mean(loss_sam_each)
-            per_horizon_terms.append(self.loss_lambda_sam * loss_sam_each)
+            loss_sam = masked_mean(loss_sam_each, "sam")
+            per_horizon_terms.append((self.loss_lambda_sam * loss_sam_each, valid_by_modality["sam"]))
             loss_terms.append(self.loss_lambda_sam * loss_sam)
         loss_dream = sum(loss_terms)
         if per_horizon_terms:
-            loss_future_each = sum(per_horizon_terms)
+            loss_future_num = sum(loss_each * modality_valid for loss_each, modality_valid in per_horizon_terms)
+            loss_future_den = sum(modality_valid for _, modality_valid in per_horizon_terms).clamp(min=1.0)
+            loss_future_each = loss_future_num / loss_future_den
+            report_valid = (sum(modality_valid for _, modality_valid in per_horizon_terms) > 0).to(
+                dtype=first_pred.float().dtype
+            )
         else:
             loss_future_each = torch.zeros_like(valid)
+            report_valid = valid
         parts = {
             "loss_dyn": loss_dyn,
             "loss_depth": loss_depth,
@@ -511,8 +548,11 @@ class DreamFastWAM(FastWAM):
             "loss_sam": loss_sam,
             "future_valid_ratio": valid.mean(),
         }
+        for name, modality_valid in valid_by_modality.items():
+            if name in targets:
+                parts[f"{name}_valid_ratio"] = modality_valid.mean()
         for horizon_idx, offset in enumerate(offsets[:num_offsets]):
-            horizon_valid = valid[:, horizon_idx]
+            horizon_valid = report_valid[:, horizon_idx]
             horizon_den = horizon_valid.sum().clamp(min=1.0)
             parts[f"future_valid_count_{offset}"] = horizon_valid.sum()
             parts[f"loss_future_{offset}"] = (loss_future_each[:, horizon_idx] * horizon_valid).sum() / horizon_den
@@ -544,6 +584,7 @@ class DreamFastWAM(FastWAM):
             )
         dream_targets = inputs["dream_targets"]
         future_valid_mask = inputs.get("future_valid_mask", None)
+        modality_valid_masks = inputs.get("modality_valid_masks", None)
         future_offsets = inputs.get("future_offsets", None)
 
         train_video_branch = self.loss_lambda_video > 0.0
@@ -673,6 +714,7 @@ class DreamFastWAM(FastWAM):
             pred_dream,
             dream_targets,
             future_valid_mask=future_valid_mask,
+            modality_valid_masks=modality_valid_masks,
             future_offsets=future_offsets,
         )
 

@@ -59,6 +59,27 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
 done
 
 RUN_ID="${RUN_ID:-$(date +%Y-%m-%d_%H-%M-%S)_${RANDOM}}"
+RUN_DIR="./runs/${TASK_BASENAME}/${RUN_ID}"
+
+write_launch_metadata() {
+  local run_dir="$1"
+  if (( MACHINE_RANK != 0 )); then
+    return 0
+  fi
+  mkdir -p "${run_dir}"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'bash %q %q' "$0" "${NPROC_PER_NODE}"
+    for arg in "${EXTRA_ARGS[@]}"; do
+      printf ' %q' "${arg}"
+    done
+    printf '\n'
+  } > "${run_dir}/launch_command.sh"
+  chmod +x "${run_dir}/launch_command.sh"
+  printf '%s\n' "${EXTRA_ARGS[@]}" > "${run_dir}/hydra_overrides.txt"
+}
+
+write_launch_metadata "${RUN_DIR}"
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
 
@@ -66,6 +87,6 @@ accelerate launch \
   --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
   --num_processes "${NPROC_PER_NODE}" \
   scripts/train_freeze_video.py \
-  "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \
+  "output_dir=${RUN_DIR}" \
   "wandb.name=${TASK_BASENAME}_${RUN_ID}" \
   "${EXTRA_ARGS[@]}"
