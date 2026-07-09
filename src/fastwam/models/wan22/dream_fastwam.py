@@ -752,6 +752,8 @@ class DreamFastWAM(FastWAM):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
         return_video: bool = False,
+        return_action_attention: bool = False,
+        attention_layers: Optional[list[int]] = None,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -774,7 +776,7 @@ class DreamFastWAM(FastWAM):
             context=context,
             context_mask=context_mask,
         )
-        tokens_out = self.mot(
+        mot_out = self.mot(
             embeds_all={"video": video_pre["tokens"], "dream": dream_pre["tokens"], "action": action_pre["tokens"]},
             attention_mask=self._build_mot_attention_mask(
                 video_seq_len=video_pre["tokens"].shape[1],
@@ -790,11 +792,22 @@ class DreamFastWAM(FastWAM):
                 "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
             },
             t_mod_all={"video": video_pre["t_mod"], "dream": dream_pre["t_mod"], "action": action_pre["t_mod"]},
+            return_action_attention=return_action_attention,
+            attention_layers=attention_layers,
         )
+        if return_action_attention:
+            tokens_out = mot_out["tokens"]
+            attention_records = mot_out["action_attention"]
+        else:
+            tokens_out = mot_out
+            attention_records = None
         pred_video = None
         if return_video:
             pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-        return pred_video, self.action_expert.post_dit(tokens_out["action"], action_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        if return_action_attention:
+            return pred_video, pred_action, attention_records
+        return pred_video, pred_action
 
     @torch.no_grad()
     def _predict_action_noise(

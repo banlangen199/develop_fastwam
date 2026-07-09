@@ -650,6 +650,8 @@ class FastWAM(torch.nn.Module):
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
+        return_action_attention: bool = False,
+        attention_layers: Optional[list[int]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
@@ -673,7 +675,7 @@ class FastWAM(torch.nn.Module):
             device=video_pre["tokens"].device,
         )
 
-        tokens_out = self.mot(
+        mot_out = self.mot(
             embeds_all={
                 "video": video_pre["tokens"],
                 "action": action_pre["tokens"],
@@ -697,10 +699,20 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            return_action_attention=return_action_attention,
+            attention_layers=attention_layers,
         )
+        if return_action_attention:
+            tokens_out = mot_out["tokens"]
+            attention_records = mot_out["action_attention"]
+        else:
+            tokens_out = mot_out
+            attention_records = None
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        if return_action_attention:
+            return pred_video, pred_action, attention_records
         return pred_video, pred_action
 
     @torch.no_grad()

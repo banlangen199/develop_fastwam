@@ -96,6 +96,32 @@ class MoT(nn.Module):
             )
         return _forward(q_cat, k_cat, v_cat)
 
+    def _compute_action_attention_probs(
+        self,
+        q_cat: torch.Tensor,
+        k_cat: torch.Tensor,
+        attention_mask: torch.Tensor,
+        action_slice: slice,
+    ) -> torch.Tensor:
+        """Debug-only action-row attention probabilities.
+
+        Flash attention does not expose probabilities, so visualization recomputes
+        only action query rows. Shape returned is [B, H, Sa, S].
+        """
+        if q_cat.shape[0] != 1:
+            raise ValueError("Action attention debug currently supports batch size 1 only.")
+        bsz, total_seq, inner_dim = q_cat.shape
+        if inner_dim != self.num_heads * self.attn_head_dim:
+            raise ValueError(
+                f"Unexpected q/k inner dim={inner_dim}, expected {self.num_heads * self.attn_head_dim}."
+            )
+        q = q_cat[:, action_slice, :].reshape(bsz, -1, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        k = k_cat.reshape(bsz, total_seq, self.num_heads, self.attn_head_dim).transpose(1, 2)
+        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (self.attn_head_dim ** -0.5)
+        action_mask = attention_mask[action_slice, :].to(device=scores.device, dtype=torch.bool)
+        scores = scores.masked_fill(~action_mask.view(1, 1, action_mask.shape[0], action_mask.shape[1]), -torch.inf)
+        return torch.softmax(scores, dim=-1).detach().cpu()
+
     @staticmethod
     def _apply_expert_post_block(
         block,
@@ -451,6 +477,8 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        return_action_attention: bool = False,
+        attention_layers: Optional[list[int]] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -468,6 +496,8 @@ class MoT(nn.Module):
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
+        attention_layers_set = None if attention_layers is None else {int(x) for x in attention_layers}
+        action_attention_records = []
 
         for layer_idx in range(self.num_layers):
             q_chunks = []
@@ -527,6 +557,29 @@ class MoT(nn.Module):
                     f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
                 )
 
+            if return_action_attention and (attention_layers_set is None or layer_idx in attention_layers_set):
+                if "action" not in self.expert_order:
+                    raise ValueError("Cannot return action attention because no action expert is present.")
+                starts = {}
+                pos = 0
+                for name, seq_len in zip(self.expert_order, seq_lens):
+                    starts[name] = (pos, pos + seq_len)
+                    pos += seq_len
+                action_start, action_end = starts["action"]
+                slices = {name: [start, end] for name, (start, end) in starts.items()}
+                action_attention_records.append(
+                    {
+                        "layer": int(layer_idx),
+                        "probs": self._compute_action_attention_probs(
+                            q_cat=q_cat,
+                            k_cat=k_cat,
+                            attention_mask=attention_mask,
+                            action_slice=slice(action_start, action_end),
+                        ),
+                        "slices": slices,
+                    }
+                )
+
             mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
 
             start = 0
@@ -553,4 +606,6 @@ class MoT(nn.Module):
                 tokens_all[name] = updated_tokens
                 start = end
 
+        if return_action_attention:
+            return {"tokens": tokens_all, "action_attention": action_attention_records}
         return tokens_all
