@@ -97,10 +97,12 @@ class DreamTargetAdapter:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
             if "depth" in self.modalities:
                 depth_cfg = self.modality_configs.get("depth", {})
-                if depth_cfg.get("source") != "depth_anything" or not depth_cfg.get("root"):
+                has_depth_root = bool(depth_cfg.get("root")) or bool(self.extra_roots.get("depth"))
+                if depth_cfg.get("source") != "depth_anything" or not has_depth_root:
                     raise ValueError(
                         "dream_target depth supervision must use Depth Anything: set "
-                        "dream_target.depth.source=depth_anything and dream_target.depth.root."
+                        "dream_target.depth.source=depth_anything and either dream_target.depth.root "
+                        "or dream_target.extra_roots.depth."
                     )
             if len(self.cameras) != 2:
                 raise ValueError(

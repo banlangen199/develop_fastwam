@@ -129,6 +129,68 @@ def _resolve_dataset_stats_path(dataset_stats_path: Optional[str]) -> Path:
     return resolved
 
 
+def _resolve_training_config_path(
+    checkpoint_path: str,
+    *,
+    use_training_config: Any,
+    training_config_path: Any,
+) -> Optional[Path]:
+    if not _parse_bool(use_training_config):
+        return None
+
+    candidates: list[Path] = []
+    if not _is_none_like(training_config_path):
+        candidates.append(Path(str(training_config_path)).expanduser())
+    else:
+        ckpt = Path(str(checkpoint_path)).expanduser()
+        for parent in list(ckpt.parents)[:6]:
+            candidates.append(parent / "config.yaml")
+
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+
+    if not _is_none_like(training_config_path):
+        raise FileNotFoundError(f"`training_config_path` does not exist: {training_config_path}")
+    logger.warning(
+        "use_training_config=true, but no training config.yaml was found near checkpoint %s. "
+        "Falling back to the composed evaluation config.",
+        checkpoint_path,
+    )
+    return None
+
+
+def _apply_training_model_config(
+    cfg: DictConfig,
+    *,
+    checkpoint_path: str,
+    use_training_config: Any,
+    training_config_path: Any,
+) -> Optional[Path]:
+    resolved = _resolve_training_config_path(
+        checkpoint_path,
+        use_training_config=use_training_config,
+        training_config_path=training_config_path,
+    )
+    if resolved is None:
+        return None
+
+    train_cfg = OmegaConf.load(resolved)
+    if "model" not in train_cfg or "data" not in train_cfg:
+        raise ValueError(f"Training config {resolved} must contain both `model` and `data` sections.")
+
+    train_container = OmegaConf.to_container(train_cfg, resolve=True)
+    cfg.model = OmegaConf.create(train_container["model"])
+    cfg.data = OmegaConf.create(train_container["data"])
+    logger.info("Aligned RobotWin evaluation model/data config with training config: %s", resolved)
+    return resolved
+
+
 def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     pil_image = Image.fromarray(image.astype(np.uint8), mode="RGB")
     resized = pil_image.resize(size_wh, resample=Image.BILINEAR)
@@ -345,6 +407,12 @@ def get_model(usr_args: Dict[str, Any]):
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):
         raise ValueError("`ckpt_setting` is required and must be a valid checkpoint path.")
+    _apply_training_model_config(
+        cfg,
+        checkpoint_path=str(checkpoint_path),
+        use_training_config=usr_args.get("use_training_config", cfg.EVALUATION.get("use_training_config", True)),
+        training_config_path=usr_args.get("training_config_path", cfg.EVALUATION.get("training_config_path")),
+    )
 
     device = str(usr_args.get("device") or cfg.EVALUATION.get("device") or "cuda")
     if device.startswith("cuda") and not torch.cuda.is_available():

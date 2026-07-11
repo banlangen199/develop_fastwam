@@ -212,6 +212,8 @@ def main(cfg: DictConfig):
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
+    _append_override(overrides, "use_training_config", cfg.EVALUATION.use_training_config)
+    _append_override(overrides, "training_config_path", cfg.EVALUATION.training_config_path)
     _append_override(overrides, "action_horizon", cfg.EVALUATION.action_horizon)
     _append_override(overrides, "replan_steps", cfg.EVALUATION.replan_steps)
     _append_override(overrides, "num_inference_steps", cfg.EVALUATION.num_inference_steps)

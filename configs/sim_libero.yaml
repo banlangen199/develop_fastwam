@@ -38,6 +38,8 @@ EVALUATION:
 
   # Optional external inputs
   dataset_stats_path: null
+  use_training_config: true
+  training_config_path: null
   device: cuda
 
 MULTIRUN:

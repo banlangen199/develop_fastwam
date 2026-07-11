@@ -86,6 +86,68 @@ def _resolve_eval_device(cfg: DictConfig) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _resolve_training_config_path(cfg: DictConfig) -> Optional[Path]:
+    if not bool(cfg.EVALUATION.get("use_training_config", True)):
+        return None
+
+    explicit = cfg.EVALUATION.get("training_config_path")
+    candidates: list[Path] = []
+    if explicit is not None:
+        candidates.append(Path(os.path.expanduser(os.path.expandvars(str(explicit)))))
+    else:
+        ckpt = Path(os.path.expanduser(os.path.expandvars(str(cfg.ckpt))))
+        for parent in list(ckpt.parents)[:6]:
+            candidates.append(parent / "config.yaml")
+
+    seen = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists():
+            return resolved
+
+    if explicit is not None:
+        raise FileNotFoundError(f"EVALUATION.training_config_path does not exist: {explicit}")
+    logging.warning(
+        "EVALUATION.use_training_config=true, but no training config.yaml was found near checkpoint %s. "
+        "Falling back to the composed evaluation config.",
+        cfg.ckpt,
+    )
+    return None
+
+
+def _apply_training_model_config(cfg: DictConfig) -> Optional[Path]:
+    training_config_path = _resolve_training_config_path(cfg)
+    if training_config_path is None:
+        return None
+
+    train_cfg = OmegaConf.load(training_config_path)
+    if "model" not in train_cfg or "data" not in train_cfg:
+        raise ValueError(
+            f"Training config {training_config_path} must contain both `model` and `data` sections."
+        )
+
+    eval_model_overrides = {}
+    for key in ("load_text_encoder", "skip_dit_load_from_pretrain", "action_dit_pretrained_path"):
+        if "model" in cfg and key in cfg.model:
+            eval_model_overrides[key] = cfg.model.get(key)
+
+    train_container = OmegaConf.to_container(train_cfg, resolve=True)
+    cfg.model = OmegaConf.create(train_container["model"])
+    cfg.data = OmegaConf.create(train_container["data"])
+
+    for key, value in eval_model_overrides.items():
+        cfg.model[key] = value
+
+    logging.info(
+        "Aligned evaluation model/data config with training config: %s",
+        training_config_path,
+    )
+    return training_config_path
+
+
 def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     explicit = cfg.EVALUATION.get("dataset_stats_path")
     candidates: list[Path] = []
@@ -702,6 +764,7 @@ def eval_single_process(cfg: DictConfig):
 
     if cfg.ckpt is None:
         raise ValueError("cfg.ckpt must not be None.")
+    training_config_path = _apply_training_model_config(cfg)
     _validate_visualize_future_video_cfg(cfg)
 
     env_num = int(cfg.EVALUATION.get("env_num", 1))
@@ -742,6 +805,12 @@ def eval_single_process(cfg: DictConfig):
 
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(config=cfg, f=str(local_log_dir / "resolved_eval_config.yaml"))
+    if training_config_path is not None:
+        (local_log_dir / "training_config_path.txt").write_text(
+            str(training_config_path) + "\n",
+            encoding="utf-8",
+        )
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
     predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"

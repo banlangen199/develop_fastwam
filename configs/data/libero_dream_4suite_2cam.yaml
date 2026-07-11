@@ -1,0 +1,17 @@
+defaults:
+  - libero_2cam
+  - _self_
+
+train:
+  dataset_name: libero_4suite
+  pretrained_norm_stats: null
+  dream_target:
+    enabled: true
+    mode: fixed_offset
+    future_offset: 4
+    future_offsets: [16,32]
+    modalities: ["dyn", "depth", "dino", "sam"]
+    depth:
+      source: depth_anything
+      root: null
+      model: depth_anything_v3
