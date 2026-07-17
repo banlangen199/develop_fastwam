@@ -9,8 +9,8 @@ train:
     enabled: true
     mode: fixed_offset
     future_offset: 4
-    future_offsets: [16,32]
-    modalities: ["dyn", "depth", "dino", "sam"]
+    future_offsets: [8,16,24,32]
+    modalities: ["depth", "dino", "sam"]
     depth:
       source: depth_anything
       root: null

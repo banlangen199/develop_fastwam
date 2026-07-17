@@ -62,6 +62,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from experiments.libero.eval_libero_single import (  # noqa: E402
+    _apply_training_model_config,
     _denormalize_action,
     _load_model_checkpoint,
     _maybe_load_action_noise_stats,
@@ -537,6 +538,7 @@ def main() -> None:
     cfg = _build_cfg(args)
     if args.device is not None:
         cfg.EVALUATION.device = args.device
+    training_config_path = _apply_training_model_config(cfg)
     device = str(cfg.EVALUATION.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=model_dtype, device=device)
@@ -564,10 +566,17 @@ def main() -> None:
     concat_multi_camera = str(cfg.data.train.get("concat_multi_camera", "horizontal"))
     out_root = _resolve_output_root(args)
     print(f"[attention-vis] output_dir={out_root}")
+    OmegaConf.save(config=cfg, f=str(out_root / "resolved_attention_config.yaml"))
+    if training_config_path is not None:
+        (out_root / "training_config_path.txt").write_text(
+            str(training_config_path) + "\n",
+            encoding="utf-8",
+        )
     run_info = {
         "model_type": args.model_type,
         "checkpoint": args.checkpoint,
         "config_name": args.config_name,
+        "training_config_path": None if training_config_path is None else str(training_config_path),
         "task_suite": args.task_suite,
         "task_id": int(args.task_id),
         "num_episodes": int(args.num_episodes),

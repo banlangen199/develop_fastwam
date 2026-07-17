@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: libero_2cam
+  - override /data: libero_dream_4suite_2cam
   - override /model: dream_fastwam
   - _self_
 
@@ -14,18 +14,13 @@ learning_rate: 1e-4
 num_epochs: 2
 max_steps: null
 log_every: 10
-save_every: 2000
+save_every: 4000
 eval_every: 0
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 2
 weight_decay: 1e-2
 resume: null
 freeze_video_expert: true
 
-data:
-  train:
-    dream_target:
-      enabled: true
-      future_offsets: [4]
 
 model:
   mot_checkpoint_mixed_attn: true
