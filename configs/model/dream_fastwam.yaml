@@ -54,6 +54,7 @@ dream_query_config:
   share_blocks: false
 
   dream_query:
+    modalities: ${data.train.dream_target.modalities}
     future_offsets: ${data.train.dream_target.future_offsets}
     n_dyn: 18
     n_depth: 18

@@ -177,7 +177,10 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
 
 
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
-    model.load_checkpoint(ckpt)
+    if "strict_shapes" in inspect.signature(model.load_checkpoint).parameters:
+        model.load_checkpoint(ckpt, strict_shapes=True)
+    else:
+        model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
     return
 

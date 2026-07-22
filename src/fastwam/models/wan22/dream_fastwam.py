@@ -254,7 +254,7 @@ class DreamFastWAM(FastWAM):
         )
         return params
 
-    def load_checkpoint(self, path, optimizer=None):
+    def load_checkpoint(self, path, optimizer=None, *, strict_shapes: bool = False):
         payload = torch.load(path, map_location="cpu")
         if "mot" in payload:
             current = self.mot.state_dict()
@@ -280,6 +280,11 @@ class DreamFastWAM(FastWAM):
                     len(skipped_shape),
                     skipped_shape[:20],
                 )
+            if strict_shapes and (skipped_shape or missing or unexpected):
+                raise RuntimeError(
+                    "Checkpoint is not structurally compatible with the current DreamFastWAM model. "
+                    f"skipped_shape={skipped_shape[:20]} missing={missing[:50]} unexpected={unexpected[:50]}"
+                )
             bad_missing = [
                 k for k in missing
                 if not (k.startswith("mixtures.dream.") or ".dream_" in k or k.startswith("dream_"))
@@ -290,6 +295,11 @@ class DreamFastWAM(FastWAM):
                     bad_missing[:50],
                 )
         elif "dit" in payload:
+            if strict_shapes:
+                raise RuntimeError(
+                    "Cannot strictly load a legacy `dit` checkpoint into DreamFastWAM. "
+                    "Use a checkpoint saved with the full `mot` state."
+                )
             logger.warning("Loading legacy `dit` checkpoint into DreamFastWAM video expert only.")
             current = self.video_expert.state_dict()
             filtered = {}
@@ -360,6 +370,15 @@ class DreamFastWAM(FastWAM):
                     device=self.device, dtype=torch.long, non_blocking=True
                 )
         return inputs
+
+    def _assert_training_dream_modalities_match(self, dream_targets: dict[str, torch.Tensor]) -> None:
+        target_modalities = set(dream_targets.keys())
+        model_modalities = set(getattr(self.dream_expert, "modalities", ("dyn", "depth", "dino", "sam")))
+        if target_modalities != model_modalities:
+            raise ValueError(
+                "Dream target modalities must match enabled dream model modalities during training. "
+                f"targets={sorted(target_modalities)} model={sorted(model_modalities)}"
+            )
 
     @torch.no_grad()
     def _build_mot_attention_mask(
@@ -583,6 +602,7 @@ class DreamFastWAM(FastWAM):
                 "DreamFastWAM training requires non-empty `sample['dream_targets']`."
             )
         dream_targets = inputs["dream_targets"]
+        self._assert_training_dream_modalities_match(dream_targets)
         future_valid_mask = inputs.get("future_valid_mask", None)
         modality_valid_masks = inputs.get("modality_valid_masks", None)
         future_offsets = inputs.get("future_offsets", None)

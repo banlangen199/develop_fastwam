@@ -13,6 +13,8 @@ from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_DREAM_MODALITIES = ("dyn", "depth", "dino", "sam")
+
 
 class DenseDreamDecoder(nn.Module):
     """Independent modality decoder from dream latent tokens to dense targets."""
@@ -189,6 +191,20 @@ class DreamQueryExpert(nn.Module):
         self.n_depth = int(dream_query.get("n_depth", legacy_kwargs.get("n_depth", 8)))
         self.n_dino = int(dream_query.get("n_dino", legacy_kwargs.get("n_dino", 8)))
         self.n_sam = int(dream_query.get("n_sam", legacy_kwargs.get("n_sam", 8)))
+        modalities = dream_query.get("modalities", legacy_kwargs.get("modalities", _DREAM_MODALITIES))
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        self.modalities = tuple(str(name) for name in modalities)
+        if not self.modalities:
+            raise ValueError("dream_query.modalities must contain at least one modality.")
+        unknown_modalities = set(self.modalities) - set(_DREAM_MODALITIES)
+        if unknown_modalities:
+            raise ValueError(
+                f"Unsupported dream_query.modalities: {sorted(unknown_modalities)}. "
+                f"Expected subset of {list(_DREAM_MODALITIES)}."
+            )
+        if len(set(self.modalities)) != len(self.modalities):
+            raise ValueError(f"dream_query.modalities contains duplicates: {list(self.modalities)}")
         future_offsets = dream_query.get("future_offsets", dream_query.get("future_steps", None))
         if future_offsets is None:
             future_offsets = legacy_kwargs.get("future_offsets", [0])
@@ -204,22 +220,23 @@ class DreamQueryExpert(nn.Module):
                 raise ValueError(f"`dream_expert.{name}` must be > 0, got {getattr(self, name)}")
         if self.attn_head_dim <= 0 or self.attn_head_dim % 2 != 0:
             raise ValueError(f"`attn_head_dim` must be positive and even for RoPE, got {self.attn_head_dim}")
-        for name in ("n_dyn", "n_depth", "n_dino", "n_sam"):
+        for modality in self.modalities:
+            name = f"n_{modality}"
             if getattr(self, name) <= 0:
                 raise ValueError(f"`dream_query.{name}` must be > 0, got {getattr(self, name)}")
 
-        self.dyn_queries = nn.Parameter(
-            torch.randn(self.num_future_offsets, self.n_dyn, self.hidden_dim) / self.hidden_dim**0.5
-        )
-        self.depth_queries = nn.Parameter(
-            torch.randn(self.num_future_offsets, self.n_depth, self.hidden_dim) / self.hidden_dim**0.5
-        )
-        self.dino_queries = nn.Parameter(
-            torch.randn(self.num_future_offsets, self.n_dino, self.hidden_dim) / self.hidden_dim**0.5
-        )
-        self.sam_queries = nn.Parameter(
-            torch.randn(self.num_future_offsets, self.n_sam, self.hidden_dim) / self.hidden_dim**0.5
-        )
+        for modality in _DREAM_MODALITIES:
+            n_tokens = getattr(self, f"n_{modality}")
+            param_name = f"{modality}_queries"
+            if modality in self.modalities:
+                self.register_parameter(
+                    param_name,
+                    nn.Parameter(
+                        torch.randn(self.num_future_offsets, n_tokens, self.hidden_dim) / self.hidden_dim**0.5
+                    ),
+                )
+            else:
+                self.register_parameter(param_name, None)
 
         self.text_embedding = nn.Sequential(
             nn.Linear(self.text_dim, self.hidden_dim),
@@ -286,7 +303,7 @@ class DreamQueryExpert(nn.Module):
         self.decoder_num_heads = decoder_heads
         self.decoder_attn_head_dim = decoder_attn_head_dim
         self.decoders = nn.ModuleDict()
-        for modality in ("dyn", "depth", "dino", "sam"):
+        for modality in self.modalities:
             cfg = dict(dream_decoder.get(modality, {}) or {})
             enabled = bool(cfg.get("enabled", True))
             self.decoders[modality] = DenseDreamDecoder(
@@ -307,17 +324,13 @@ class DreamQueryExpert(nn.Module):
 
     @property
     def num_dream_tokens(self) -> int:
-        return self.num_future_offsets * (self.n_dyn + self.n_depth + self.n_dino + self.n_sam)
+        return sum(self.num_future_offsets * getattr(self, f"n_{name}") for name in self.modalities)
 
     def modality_slices(self) -> dict[str, slice]:
         start = 0
         slices = {}
-        for name, length in (
-            ("dyn", self.num_future_offsets * self.n_dyn),
-            ("depth", self.num_future_offsets * self.n_depth),
-            ("dino", self.num_future_offsets * self.n_dino),
-            ("sam", self.num_future_offsets * self.n_sam),
-        ):
+        for name in self.modalities:
+            length = self.num_future_offsets * getattr(self, f"n_{name}")
             end = start + length
             slices[name] = slice(start, end)
             start = end
@@ -335,6 +348,7 @@ class DreamQueryExpert(nn.Module):
                 "num_heads": self.num_heads,
                 "attn_head_dim": self.attn_head_dim,
                 "num_dream_tokens": self.num_dream_tokens,
+                "modalities": list(self.modalities),
                 "future_offsets": list(self.future_offsets),
                 "num_future_offsets": self.num_future_offsets,
                 "target_num_params_m": self.target_num_params_m,
@@ -345,6 +359,7 @@ class DreamQueryExpert(nn.Module):
                 "num_layers": self.decoder_num_layers,
                 "num_heads": self.decoder_num_heads,
                 "attn_head_dim": self.decoder_attn_head_dim,
+                "enabled_modalities": list(self.modalities),
                 "modalities": {
                     name: {
                         "enabled": bool(decoder.enabled),
@@ -369,15 +384,19 @@ class DreamQueryExpert(nn.Module):
     ) -> Dict[str, Any]:
         if batch_size <= 0:
             raise ValueError(f"`batch_size` must be > 0, got {batch_size}")
-        queries = torch.cat(
-            [
-                self.dyn_queries.reshape(1, self.num_future_offsets * self.n_dyn, self.hidden_dim),
-                self.depth_queries.reshape(1, self.num_future_offsets * self.n_depth, self.hidden_dim),
-                self.dino_queries.reshape(1, self.num_future_offsets * self.n_dino, self.hidden_dim),
-                self.sam_queries.reshape(1, self.num_future_offsets * self.n_sam, self.hidden_dim),
-            ],
-            dim=1,
-        ).to(device=device, dtype=dtype)
+        query_chunks = []
+        for modality in self.modalities:
+            query = getattr(self, f"{modality}_queries")
+            if query is None:
+                raise RuntimeError(f"Dream modality {modality!r} is enabled but has no query parameter.")
+            query_chunks.append(
+                query.reshape(
+                    1,
+                    self.num_future_offsets * getattr(self, f"n_{modality}"),
+                    self.hidden_dim,
+                )
+            )
+        queries = torch.cat(query_chunks, dim=1).to(device=device, dtype=dtype)
         tokens = queries.expand(batch_size, -1, -1).contiguous()
         freqs = self.freqs[: self.num_dream_tokens].view(self.num_dream_tokens, 1, -1).to(tokens.device)
         t_mod = self.dream_t_mod.to(device=device, dtype=dtype).expand(batch_size, -1, -1)
@@ -427,7 +446,7 @@ class DreamQueryExpert(nn.Module):
             raise ValueError(f"Dream token length mismatch: expected {expected}, got {tokens.shape[1]}")
         slices = pre_state["meta"]["modality_slices"]
         out = {}
-        for name in ("dyn", "depth", "dino", "sam"):
+        for name in self.modalities:
             decoder = self.decoders[name]
             if not bool(getattr(decoder, "enabled", True)):
                 continue

@@ -238,7 +238,10 @@ class WorldActionRobotWinPolicy:
         model_cfg_copy.load_text_encoder = True
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
-        self.model.load_checkpoint(checkpoint_path)
+        if "strict_shapes" in inspect.signature(self.model.load_checkpoint).parameters:
+            self.model.load_checkpoint(checkpoint_path, strict_shapes=True)
+        else:
+            self.model.load_checkpoint(checkpoint_path)
         _maybe_load_action_noise_stats(self.model, model_cfg_copy, dataset_stats_path)
         self.model = self.model.to(device).eval()
 
