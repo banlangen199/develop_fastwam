@@ -56,6 +56,10 @@ dream_query_config:
   dream_query:
     modalities: ${data.train.dream_target.modalities}
     future_offsets: ${data.train.dream_target.future_offsets}
+    # Per horizon and modality: tokens [0:9] belong to the primary camera and
+    # tokens [9:18] belong to the wrist camera. They can interact in Dream DiT,
+    # but each camera decoder can only read its own nine tokens.
+    camera_token_split: [9, 9]
     n_dyn: 18
     n_depth: 18
     n_dino: 18

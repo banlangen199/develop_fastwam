@@ -128,6 +128,103 @@ class DenseDreamDecoder(nn.Module):
             return out.reshape(latent_tokens.shape[0], *self.target_shape)
         return out
 
+    def _two_view_query_indices(self, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return output-query indices for the left (primary) and right (wrist) views."""
+        if self.target_layout == "grid_feature":
+            grid_h, combined_grid_w = self.output_grid_shape
+            if combined_grid_w % 2 != 0:
+                raise ValueError(
+                    f"{self.modality} two-view grid width must be even, got {self.output_grid_shape}."
+                )
+            per_view_grid_w = combined_grid_w // 2
+        elif self.target_layout == "token_feature":
+            per_view_tokens = self.num_output_tokens // 2
+            per_view_grid_w = int(round(per_view_tokens**0.5))
+            if (
+                self.num_output_tokens % 2 != 0
+                or per_view_grid_w * per_view_grid_w != per_view_tokens
+            ):
+                raise ValueError(
+                    f"{self.modality} two-view token_feature target must contain two square "
+                    f"camera grids, got num_output_tokens={self.num_output_tokens}."
+                )
+            grid_h = per_view_grid_w
+            combined_grid_w = per_view_grid_w * 2
+        else:
+            raise ValueError(
+                f"{self.modality} two-view decoding does not support layout={self.target_layout!r}."
+            )
+
+        grid_indices = torch.arange(
+            grid_h * combined_grid_w, device=device, dtype=torch.long
+        ).reshape(grid_h, combined_grid_w)
+        return (
+            grid_indices[:, :per_view_grid_w].reshape(-1),
+            grid_indices[:, per_view_grid_w:].reshape(-1),
+        )
+
+    def _decode_with_queries(
+        self,
+        latent_tokens: torch.Tensor,
+        query_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        memory = self.latent_proj(latent_tokens)
+        queries = self.output_queries.index_select(1, query_indices).to(
+            device=latent_tokens.device, dtype=memory.dtype
+        )
+        queries = queries.expand(latent_tokens.shape[0], -1, -1)
+        return self.output_proj(self.decoder(tgt=queries, memory=memory))
+
+    def forward_two_view(
+        self,
+        primary_latent_tokens: torch.Tensor,
+        wrist_latent_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode each camera only from its assigned Dream latent tokens."""
+        if not self.enabled:
+            raise RuntimeError(f"Decoder for modality={self.modality!r} is disabled.")
+        if primary_latent_tokens.ndim != 3 or wrist_latent_tokens.ndim != 3:
+            raise ValueError(
+                f"{self.modality} two-view latent tokens must both be [B,N,D], got "
+                f"{tuple(primary_latent_tokens.shape)} and {tuple(wrist_latent_tokens.shape)}."
+            )
+        if (
+            primary_latent_tokens.shape[0] != wrist_latent_tokens.shape[0]
+            or primary_latent_tokens.shape[2] != wrist_latent_tokens.shape[2]
+        ):
+            raise ValueError(
+                f"{self.modality} primary/wrist latent batch and feature dimensions must match."
+            )
+
+        primary_indices, wrist_indices = self._two_view_query_indices(
+            device=primary_latent_tokens.device
+        )
+        primary_out = self._decode_with_queries(primary_latent_tokens, primary_indices)
+        wrist_out = self._decode_with_queries(wrist_latent_tokens, wrist_indices)
+
+        if self.target_layout == "grid_feature":
+            grid_h, combined_grid_w = self.output_grid_shape
+            per_view_grid_w = combined_grid_w // 2
+            primary_out = primary_out.reshape(
+                primary_out.shape[0], grid_h, per_view_grid_w, self.feature_dim
+            )
+            wrist_out = wrist_out.reshape(
+                wrist_out.shape[0], grid_h, per_view_grid_w, self.feature_dim
+            )
+            return torch.cat([primary_out, wrist_out], dim=2)
+
+        per_view_tokens = self.num_output_tokens // 2
+        grid_h = int(round(per_view_tokens**0.5))
+        primary_out = primary_out.reshape(
+            primary_out.shape[0], grid_h, grid_h, self.feature_dim
+        )
+        wrist_out = wrist_out.reshape(
+            wrist_out.shape[0], grid_h, grid_h, self.feature_dim
+        )
+        return torch.cat([primary_out, wrist_out], dim=2).reshape(
+            primary_out.shape[0], self.num_output_tokens, self.feature_dim
+        )
+
 
 class DreamQueryExpert(nn.Module):
     """Learnable dream latent expert plus independent dense modality decoders."""
@@ -191,6 +288,20 @@ class DreamQueryExpert(nn.Module):
         self.n_depth = int(dream_query.get("n_depth", legacy_kwargs.get("n_depth", 8)))
         self.n_dino = int(dream_query.get("n_dino", legacy_kwargs.get("n_dino", 8)))
         self.n_sam = int(dream_query.get("n_sam", legacy_kwargs.get("n_sam", 8)))
+        camera_token_split = dream_query.get("camera_token_split", None)
+        if camera_token_split is None:
+            self.camera_token_split = None
+        else:
+            if not isinstance(camera_token_split, (list, tuple)) or len(camera_token_split) != 2:
+                raise ValueError(
+                    "dream_query.camera_token_split must be [primary_tokens, wrist_tokens]."
+                )
+            self.camera_token_split = tuple(int(x) for x in camera_token_split)
+            if any(x <= 0 for x in self.camera_token_split):
+                raise ValueError(
+                    "dream_query.camera_token_split entries must both be positive, got "
+                    f"{list(self.camera_token_split)}."
+                )
         modalities = dream_query.get("modalities", legacy_kwargs.get("modalities", _DREAM_MODALITIES))
         if isinstance(modalities, str):
             modalities = [modalities]
@@ -224,6 +335,14 @@ class DreamQueryExpert(nn.Module):
             name = f"n_{modality}"
             if getattr(self, name) <= 0:
                 raise ValueError(f"`dream_query.{name}` must be > 0, got {getattr(self, name)}")
+            if (
+                self.camera_token_split is not None
+                and sum(self.camera_token_split) != getattr(self, name)
+            ):
+                raise ValueError(
+                    f"dream_query.camera_token_split={list(self.camera_token_split)} must sum "
+                    f"to dream_query.{name}={getattr(self, name)}."
+                )
 
         for modality in _DREAM_MODALITIES:
             n_tokens = getattr(self, f"n_{modality}")
@@ -351,6 +470,9 @@ class DreamQueryExpert(nn.Module):
                 "modalities": list(self.modalities),
                 "future_offsets": list(self.future_offsets),
                 "num_future_offsets": self.num_future_offsets,
+                "camera_token_split": (
+                    None if self.camera_token_split is None else list(self.camera_token_split)
+                ),
                 "target_num_params_m": self.target_num_params_m,
             },
             "dream_decoder": {
@@ -456,6 +578,16 @@ class DreamQueryExpert(nn.Module):
             modality_tokens = modality_tokens.reshape(
                 bsz, self.num_future_offsets, per_offset_tokens, dim
             )
-            decoded = decoder(modality_tokens.reshape(bsz * self.num_future_offsets, per_offset_tokens, dim))
+            flat_tokens = modality_tokens.reshape(
+                bsz * self.num_future_offsets, per_offset_tokens, dim
+            )
+            if self.camera_token_split is None:
+                decoded = decoder(flat_tokens)
+            else:
+                primary_tokens, wrist_tokens = self.camera_token_split
+                decoded = decoder.forward_two_view(
+                    flat_tokens[:, :primary_tokens, :],
+                    flat_tokens[:, primary_tokens : primary_tokens + wrist_tokens, :],
+                )
             out[name] = decoded.reshape(bsz, self.num_future_offsets, *decoded.shape[1:])
         return out

@@ -772,9 +772,10 @@ class DreamFastWAM(FastWAM):
         fuse_vae_embedding_in_latents: bool,
         gt_action: Optional[torch.Tensor] = None,
         return_video: bool = False,
+        return_dream: bool = False,
         return_action_attention: bool = False,
         attention_layers: Optional[list[int]] = None,
-    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    ):
         video_pre = self.video_expert.pre_dit(
             x=latents_video,
             timestep=timestep_video,
@@ -824,9 +825,16 @@ class DreamFastWAM(FastWAM):
         pred_video = None
         if return_video:
             pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_dream = None
+        if return_dream:
+            pred_dream = self.dream_expert.post_dit(tokens_out["dream"], dream_pre)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        if return_action_attention and return_dream:
+            return pred_video, pred_action, pred_dream, attention_records
         if return_action_attention:
             return pred_video, pred_action, attention_records
+        if return_dream:
+            return pred_video, pred_action, pred_dream
         return pred_video, pred_action
 
     @torch.no_grad()
@@ -838,12 +846,13 @@ class DreamFastWAM(FastWAM):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
-    ) -> torch.Tensor:
+        return_dream: bool = False,
+    ):
         # Correctness-first DreamFastWAM inference: run full video+dream+action MoT
         # each step. Later this can be optimized with prefill_video_dream_cache and
         # forward_action_with_context_cache.
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
-        _, pred_action = self._predict_joint_noise(
+        joint_out = self._predict_joint_noise(
             latents_video=first_frame_latents,
             latents_action=latents_action,
             timestep_video=timestep_video,
@@ -852,7 +861,11 @@ class DreamFastWAM(FastWAM):
             context_mask=context_mask,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
             gt_action=None,
+            return_dream=return_dream,
         )
+        pred_action = joint_out[1]
+        if return_dream:
+            return pred_action, joint_out[2]
         return pred_action
 
     @torch.no_grad()
@@ -871,6 +884,7 @@ class DreamFastWAM(FastWAM):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        return_dream_predictions: bool = False,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale
         self.eval()
@@ -953,19 +967,42 @@ class DreamFastWAM(FastWAM):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
+        dream_predictions = None
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-            pred_action = self._predict_action_noise(
+            capture_dream = bool(return_dream_predictions and dream_predictions is None)
+            noise_out = self._predict_action_noise(
                 first_frame_latents=first_frame_latents,
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
                 fuse_vae_embedding_in_latents=fuse_flag,
+                return_dream=capture_dream,
             )
+            if capture_dream:
+                pred_action, dream_predictions = noise_out
+            else:
+                pred_action = noise_out
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+        output = {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
+        if return_dream_predictions:
+            if dream_predictions is None:
+                raise RuntimeError(
+                    "Dream predictions were requested but the action inference schedule was empty."
+                )
+            output["dream_predictions"] = {
+                name: value[0].detach().to(device="cpu", dtype=torch.float32)
+                for name, value in dream_predictions.items()
+            }
+            output["future_offsets"] = list(self.dream_expert.future_offsets)
+            output["camera_token_split"] = (
+                None
+                if self.dream_expert.camera_token_split is None
+                else list(self.dream_expert.camera_token_split)
+            )
+        return output
 
     @torch.no_grad()
     def _predict_action_noise_with_cache(self, *args, **kwargs) -> torch.Tensor:

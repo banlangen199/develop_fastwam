@@ -1,0 +1,56 @@
+# @package _global_
+
+defaults:
+  - train
+  - override /task: dream_fastwam_libero
+  - _self_
+
+ckpt: null
+gpu_id: 0
+
+# These evaluation-only overrides are kept when the model/data sections are
+# aligned with the training config saved next to the checkpoint.
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+
+EVALUATION:
+  task_suite_name: libero_spatial
+  task_id: 0
+  initial_state_index: 0
+  output_dir: ./evaluate_results/dream_episode/${now:%Y%m%d_%H%M%S}
+
+  num_steps_wait: 30
+  replan_steps: 10
+  max_steps: null
+  binarize_gripper: true
+  action_horizon: null
+  num_inference_steps: ${eval_num_inference_steps}
+  sigma_shift: null
+  text_cfg_scale: 1.0
+  negative_prompt: ""
+  rand_device: cpu
+  tiled: false
+  device: cuda
+
+  dataset_stats_path: null
+  use_training_config: true
+  training_config_path: null
+
+VISUALIZATION:
+  save_rollout_video: true
+  render_after_inference: true
+  fps: 5
+  panel_size: 224
+  overlay_alpha: 0.5
+  sam_clusters: 8
+  draw_contours: true
+  max_projection_samples: 2048
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
