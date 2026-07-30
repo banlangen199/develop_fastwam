@@ -48,7 +48,7 @@ def test_two_view_token_decoder_restores_horizontal_patch_order():
 
 def test_configured_modality_shapes_split_into_equal_camera_regions():
     specs = [
-        ((128, 256), "token_feature", 64),
+        ((512, 64), "token_feature", 256),
         ((392, 1), "token_feature", 196),
         ((16, 32, 768), "grid_feature", 256),
         ((16, 32, 256), "grid_feature", 256),

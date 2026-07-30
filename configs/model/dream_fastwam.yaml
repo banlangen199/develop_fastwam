@@ -88,8 +88,8 @@ dream_query_config:
       enabled: true
       target_layout: token_feature
       source_layout: image
-      patch_size: 16
-      target_shape: [128, 256]
+      patch_size: 8
+      target_shape: [512, 64]
     dino:
       enabled: true
       target_layout: grid_feature

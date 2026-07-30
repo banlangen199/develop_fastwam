@@ -605,14 +605,38 @@ class DreamTargetAdapter:
                 raise ValueError(
                     f"{modality} flat target length {tensor.numel()} is not divisible by feature_dim={feature_dim}."
                 )
+            if modality == "sam":
+                # SAM extras are serialized by flattening the image-encoder
+                # feature map in CHW order. Restore that layout before forming
+                # spatial tokens; reshape(-1, C) would mix spatial positions
+                # into the feature dimension.
+                num_tokens = tensor.numel() // feature_dim
+                grid_h, grid_w = self._infer_token_grid(modality, num_tokens)
+                return (
+                    tensor.reshape(feature_dim, grid_h, grid_w)
+                    .permute(1, 2, 0)
+                    .reshape(num_tokens, feature_dim)
+                    .contiguous()
+                )
             return tensor.reshape(-1, feature_dim)
         if tensor.ndim == 2:
             if tensor.shape[-1] == feature_dim:
                 return tensor
             if tensor.numel() % feature_dim == 0:
                 return tensor.reshape(-1, feature_dim)
-        if tensor.ndim >= 3 and tensor.shape[-1] == feature_dim:
-            return tensor.reshape(-1, feature_dim)
+        if tensor.ndim >= 3:
+            if tensor.shape[-1] == feature_dim:
+                return tensor.reshape(-1, feature_dim)
+            if modality == "sam" and tensor.ndim == 3 and tensor.shape[0] == feature_dim:
+                grid_h, grid_w = self._infer_token_grid(
+                    modality, tensor.shape[1] * tensor.shape[2]
+                )
+                if tuple(tensor.shape[1:]) != (grid_h, grid_w):
+                    raise ValueError(
+                        f"SAM CHW target has spatial shape {tuple(tensor.shape[1:])}, "
+                        f"expected {(grid_h, grid_w)}."
+                    )
+                return tensor.permute(1, 2, 0).reshape(-1, feature_dim).contiguous()
         raise ValueError(
             f"Cannot convert {modality} target shape {tuple(tensor.shape)} to [N,{feature_dim}]."
         )
