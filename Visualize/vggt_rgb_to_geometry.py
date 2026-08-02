@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run the official VGGT model on RGB views and save depth and point clouds.
 
-This utility is intentionally independent from FastWAM. It accepts ordinary
-image files, loads VGGT through its official Python package, and writes raw
-NumPy predictions plus visualization products.
+It accepts either ordinary image files or a Dream episode ``replan_XXXX.pt``
+record containing ``record["rgb"]``. It loads VGGT through its official Python
+package and writes raw NumPy predictions plus visualization products.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +66,92 @@ def _processed_rgb(images: torch.Tensor) -> np.ndarray:
     """Convert official VGGT preprocessing output [S,3,H,W] to uint8 RGB."""
     array = images.detach().cpu().float().permute(0, 2, 3, 1).numpy()
     return (np.nan_to_num(array).clip(0, 1) * 255.0).round().astype(np.uint8)
+
+
+def _uint8_rgb(value: Any, *, name: str) -> np.ndarray:
+    array = _to_numpy(value)
+    if array.ndim != 3 or array.shape[-1] != 3:
+        raise ValueError(
+            f"{name} must be an RGB image with shape [H,W,3], got {array.shape}."
+        )
+    if array.dtype != np.uint8:
+        array = array.astype(np.float32)
+        if array.size and float(np.nanmax(array)) <= 1.5:
+            array *= 255.0
+        array = np.nan_to_num(array).clip(0, 255).astype(np.uint8)
+    return array
+
+
+def _preprocess_rgb_arrays(rgb_arrays: list[np.ndarray]) -> torch.Tensor:
+    """Apply the official VGGT crop preprocessing directly to in-memory RGB."""
+    if not rgb_arrays:
+        raise ValueError("At least one RGB view is required.")
+
+    target_size = 518
+    images: list[torch.Tensor] = []
+    shapes: set[tuple[int, int]] = set()
+    for array in rgb_arrays:
+        image = Image.fromarray(array)
+        width, height = image.size
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+        image = image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        image_tensor = torch.from_numpy(
+            np.asarray(image, dtype=np.float32).copy()
+        ).permute(2, 0, 1) / 255.0
+        if new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            image_tensor = image_tensor[:, start_y : start_y + target_size, :]
+        shapes.add((image_tensor.shape[1], image_tensor.shape[2]))
+        images.append(image_tensor)
+
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+        padded_images = []
+        for image in images:
+            h_padding = max_height - image.shape[1]
+            w_padding = max_width - image.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                image = torch.nn.functional.pad(
+                    image,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+            padded_images.append(image)
+        images = padded_images
+
+    return torch.stack(images)
+
+
+def _load_record_images(
+    record_path: Path,
+    view_names: list[str],
+) -> tuple[torch.Tensor, list[str]]:
+    resolved = record_path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Input record does not exist: {resolved}")
+    record = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(record, dict) or not isinstance(record.get("rgb"), dict):
+        raise ValueError(f"{resolved} must contain a record['rgb'] mapping.")
+    missing = [name for name in view_names if name not in record["rgb"]]
+    if missing:
+        available = sorted(record["rgb"])
+        raise KeyError(
+            f"RGB views {missing} are missing from {resolved}; available views: {available}"
+        )
+    rgb_arrays = [
+        _uint8_rgb(record["rgb"][name], name=f"record['rgb'][{name!r}]")
+        for name in view_names
+    ]
+    images = _preprocess_rgb_arrays(rgb_arrays)
+    inputs = [f"{resolved}::rgb.{name}" for name in view_names]
+    return images, inputs
 
 
 def _point_mask(
@@ -190,7 +277,7 @@ def run_vggt(args: argparse.Namespace) -> dict[str, Any]:
 
     from Visualize.modality_visualization import depth_colormap
 
-    if len(args.images) != len(args.view_names):
+    if args.images is not None and len(args.images) != len(args.view_names):
         raise ValueError("--view-names must contain exactly one name per --images entry.")
     if len(set(args.view_names)) != len(args.view_names):
         raise ValueError("--view-names entries must be unique.")
@@ -198,11 +285,6 @@ def run_vggt(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--point-stride must be at least 1.")
     if not 0 <= args.confidence_percentile < 100:
         raise ValueError("--confidence-percentile must be in [0,100).")
-    image_paths = [path.expanduser().resolve() for path in args.images]
-    missing = [str(path) for path in image_paths if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"Input image files do not exist: {missing}")
-
     (
         VGGT,
         load_and_preprocess_images,
@@ -217,8 +299,17 @@ def run_vggt(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    images = load_and_preprocess_images([str(path) for path in image_paths]).to(device)
-    if images.ndim != 4 or images.shape[0] != len(image_paths):
+    if args.record is not None:
+        images, input_sources = _load_record_images(args.record, args.view_names)
+    else:
+        image_paths = [path.expanduser().resolve() for path in args.images]
+        missing = [str(path) for path in image_paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Input image files do not exist: {missing}")
+        images = load_and_preprocess_images([str(path) for path in image_paths])
+        input_sources = [str(path) for path in image_paths]
+    images = images.to(device)
+    if images.ndim != 4 or images.shape[0] != len(args.view_names):
         raise ValueError(
             "Official VGGT preprocessing must return [S,3,H,W]; "
             f"got {tuple(images.shape)}."
@@ -266,7 +357,7 @@ def run_vggt(args: argparse.Namespace) -> dict[str, Any]:
     np.savez_compressed(
         output_dir / "predictions.npz",
         view_names=np.asarray(args.view_names),
-        input_paths=np.asarray([str(path) for path in image_paths]),
+        input_paths=np.asarray(input_sources),
         processed_rgb=rgb,
         pose_encoding=pose_encoding,
         extrinsic=extrinsic,
@@ -322,7 +413,8 @@ def run_vggt(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device),
         "dtype": str(dtype).removeprefix("torch."),
         "view_names": list(args.view_names),
-        "input_paths": [str(path) for path in image_paths],
+        "input_paths": input_sources,
+        "input_record": str(args.record.expanduser().resolve()) if args.record else None,
         "processed_shape": list(rgb.shape),
         "depth_range_percentile_2_98": depth_range,
         "raw_predictions": str(output_dir / "predictions.npz"),
@@ -345,18 +437,26 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
         "--images",
         type=Path,
         nargs="+",
-        required=True,
         help="Ordered RGB image paths, normally primary then wrist.",
+    )
+    inputs.add_argument(
+        "--record",
+        type=Path,
+        help="Dream episode replan_XXXX.pt containing record['rgb'].",
     )
     parser.add_argument(
         "--view-names",
         nargs="+",
         default=["image", "wrist_image"],
-        help="Output names corresponding one-to-one with --images.",
+        help=(
+            "Ordered output view names. With --record these are also the keys "
+            "read from record['rgb'] (default: image wrist_image)."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Back-project FastWAM Depth Anything metric depth to a PLY point cloud.
+"""Back-project Depth Anything metric depth to a PLY point cloud.
 
-The default invocation reconstructs one agent-view frame in its camera frame:
+Depth can come from dataset extras or directly from a DreamFastWAM
+``replan_XXXX.pt`` prediction record. For example:
 
-  python scripts/depth_anything_to_pointcloud.py \
+  python Visualize/depth_anything_to_pointcloud.py \
     --dataset-root data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot \
     --episode 0 --frame 0 --output pointcloud.ply
+
+  python Visualize/depth_anything_to_pointcloud.py \
+    --record raw_predictions/replan_0000.pt \
+    --future-offset 16 --cameras image --no-color \
+    --output dream_depth_t16_image.ply
 
 Depth Anything V3 metric depth is interpreted as Z depth in metres.  LIBERO's
 default camera vertical field of view is 45 degrees.  Pass calibrated
@@ -28,9 +34,10 @@ import json
 import math
 import subprocess
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
+from PIL import Image
 
 
 VIDEO_KEYS = {
@@ -68,6 +75,106 @@ def load_depth(extras_root: Path, camera: str, episode: int, frame: int) -> np.n
     if valid_path.exists() and not bool(np.load(valid_path, mmap_mode="r")[row]):
         raise ValueError(f"frame {frame} is marked invalid in {valid_path}")
     return np.asarray(np.load(depth_path, mmap_mode="r")[row], dtype=np.float32)
+
+
+def _as_numpy(value: Any) -> np.ndarray:
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().float().numpy()
+    except ImportError:
+        pass
+    return np.asarray(value)
+
+
+def _split_flat_square_views(prediction: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if prediction.ndim != 2 or prediction.shape[0] % 2 != 0:
+        raise ValueError(
+            "Dream depth must contain two flattened views with shape [2N,P], "
+            f"got {prediction.shape}."
+        )
+    per_view = prediction.shape[0] // 2
+    side = int(round(per_view**0.5))
+    if side * side != per_view:
+        raise ValueError(
+            f"Each Dream depth view must form a square grid, got {per_view} positions."
+        )
+    combined = prediction.reshape(side, side * 2, prediction.shape[-1])
+    return combined[:, :side], combined[:, side:]
+
+
+def _unpatchify_depth(patch_grid: np.ndarray) -> np.ndarray:
+    if patch_grid.ndim != 3:
+        raise ValueError(f"Dream depth patch grid must be [H,W,P], got {patch_grid.shape}.")
+    patch_side = int(round(patch_grid.shape[-1] ** 0.5))
+    if patch_side * patch_side != patch_grid.shape[-1]:
+        raise ValueError(
+            f"Dream depth patch dimension must be square, got {patch_grid.shape[-1]}."
+        )
+    grid_h, grid_w = patch_grid.shape[:2]
+    return (
+        patch_grid.reshape(grid_h, grid_w, patch_side, patch_side)
+        .transpose(0, 2, 1, 3)
+        .reshape(grid_h * patch_side, grid_w * patch_side)
+        .astype(np.float32, copy=False)
+    )
+
+
+def load_record_depths(
+    record_path: Path,
+    *,
+    future_offset: int | None,
+    horizon_index: int | None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any], int, int]:
+    """Load and unpatchify both predicted depth views from a Dream record."""
+    import torch
+
+    resolved = record_path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Dream prediction record does not exist: {resolved}")
+    record = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(record, dict):
+        raise ValueError(f"Dream prediction record must be a mapping: {resolved}")
+    predictions = record.get("dream_predictions")
+    if not isinstance(predictions, dict) or "depth" not in predictions:
+        raise ValueError(f"{resolved} does not contain dream_predictions['depth'].")
+
+    depth_predictions = _as_numpy(predictions["depth"])
+    offsets = [int(value) for value in record.get("future_offsets", [])]
+    if depth_predictions.ndim != 3:
+        raise ValueError(
+            "dream_predictions['depth'] must be [num_horizons,2N,P], "
+            f"got {depth_predictions.shape}."
+        )
+    if len(offsets) != depth_predictions.shape[0]:
+        raise ValueError(
+            f"future_offsets={offsets} does not match depth horizons "
+            f"{depth_predictions.shape[0]}."
+        )
+
+    if future_offset is not None:
+        if future_offset not in offsets:
+            raise ValueError(
+                f"future offset {future_offset} is unavailable; choose one of {offsets}."
+            )
+        selected_index = offsets.index(future_offset)
+    else:
+        selected_index = 0 if horizon_index is None else horizon_index
+        if not 0 <= selected_index < len(offsets):
+            raise IndexError(
+                f"horizon index {selected_index} is outside [0,{len(offsets) - 1}]."
+            )
+    selected_offset = offsets[selected_index]
+
+    primary_grid, wrist_grid = _split_flat_square_views(
+        np.asarray(depth_predictions[selected_index], dtype=np.float32)
+    )
+    depths = {
+        "image": _unpatchify_depth(primary_grid),
+        "wrist_image": _unpatchify_depth(wrist_grid),
+    }
+    return depths, record, selected_index, selected_offset
 
 
 def intrinsics_from_fovy(height: int, width: int, fovy_degrees: float) -> tuple[float, float, float, float]:
@@ -139,6 +246,22 @@ def read_video_frame(video: Path, frame: int, output_hw: tuple[int, int]) -> np.
     return np.frombuffer(result.stdout, dtype=np.uint8).reshape(height, width, 3)
 
 
+def resize_record_rgb(value: Any, output_hw: tuple[int, int]) -> np.ndarray:
+    """Resize the record's current-observation RGB to the depth resolution."""
+    rgb = _as_numpy(value)
+    if rgb.ndim != 3 or rgb.shape[-1] != 3:
+        raise ValueError(f"record RGB must be [H,W,3], got {rgb.shape}.")
+    if rgb.dtype != np.uint8:
+        rgb = rgb.astype(np.float32)
+        if rgb.size and float(np.nanmax(rgb)) <= 1.5:
+            rgb *= 255.0
+        rgb = np.nan_to_num(rgb).clip(0, 255).astype(np.uint8)
+    height, width = output_hw
+    return np.asarray(
+        Image.fromarray(rgb).resize((width, height), Image.Resampling.BILINEAR)
+    )
+
+
 def write_ply(path: Path, points: np.ndarray, colors: np.ndarray | None = None) -> None:
     """Write an interoperable ASCII PLY without requiring Open3D."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,9 +293,26 @@ def parse_assignments(values: list[str]) -> Mapping[str, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--episode", type=int, required=True)
-    parser.add_argument("--frame", type=int, required=True, help="LeRobot frame_index within the episode")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--dataset-root", type=Path)
+    source.add_argument(
+        "--record",
+        type=Path,
+        help="DreamFastWAM replan_XXXX.pt containing predicted depth.",
+    )
+    parser.add_argument("--episode", type=int)
+    parser.add_argument("--frame", type=int, help="LeRobot frame_index within the episode")
+    horizon = parser.add_mutually_exclusive_group()
+    horizon.add_argument(
+        "--future-offset",
+        type=int,
+        help="Select a Dream prediction by its future offset, e.g. 16 or 32.",
+    )
+    horizon.add_argument(
+        "--horizon-index",
+        type=int,
+        help="Select a Dream prediction by zero-based index (default: 0).",
+    )
     parser.add_argument("--cameras", nargs="+", choices=tuple(VIDEO_KEYS), default=["image"])
     parser.add_argument("--output", type=Path, required=True)
     intrinsics_group = parser.add_mutually_exclusive_group()
@@ -180,6 +320,14 @@ def main() -> None:
     intrinsics_group.add_argument("--intrinsics", type=float, nargs=4, metavar=("FX", "FY", "CX", "CY"))
     parser.add_argument("--pose", action="append", default=[], metavar="CAMERA=PATH",
                         help="camera-to-world [4,4] or [T,4,4]; required when fusing cameras")
+    parser.add_argument(
+        "--pose-frame",
+        type=int,
+        help=(
+            "Frame selected from a [T,4,4] pose file for --record. Defaults to "
+            "record metadata env_step plus the selected future offset."
+        ),
+    )
     parser.add_argument("--stride", type=int, default=1, help="keep every Nth pixel")
     parser.add_argument("--min-depth", type=float, default=0.05)
     parser.add_argument("--max-depth", type=float, default=5.0)
@@ -188,6 +336,33 @@ def main() -> None:
 
     if args.stride < 1:
         parser.error("--stride must be at least 1")
+    if args.dataset_root is not None:
+        if args.episode is None or args.frame is None:
+            parser.error("--dataset-root requires --episode and --frame")
+        if args.future_offset is not None or args.horizon_index is not None:
+            parser.error("--future-offset/--horizon-index can only be used with --record")
+        if args.pose_frame is not None:
+            parser.error("--pose-frame can only be used with --record")
+        record_depths = None
+        record = None
+        selected_offset = None
+        pose_frame = args.frame
+    else:
+        if args.episode is not None or args.frame is not None:
+            parser.error("--episode/--frame can only be used with --dataset-root")
+        try:
+            record_depths, record, _, selected_offset = load_record_depths(
+                args.record,
+                future_offset=args.future_offset,
+                horizon_index=args.horizon_index,
+            )
+        except (FileNotFoundError, IndexError, KeyError, ValueError) as error:
+            parser.error(str(error))
+        metadata = record.get("metadata", {})
+        pose_frame = args.pose_frame
+        if pose_frame is None:
+            pose_frame = int(metadata.get("env_step", 0)) + selected_offset
+
     poses = parse_assignments(args.pose)
     if len(args.cameras) > 1:
         missing = [camera for camera in args.cameras if camera not in poses]
@@ -196,27 +371,50 @@ def main() -> None:
 
     all_points, all_colors = [], []
     for camera in args.cameras:
-        depth = load_depth(args.dataset_root / "extras", camera, args.episode, args.frame)
+        if args.dataset_root is not None:
+            depth = load_depth(
+                args.dataset_root / "extras", camera, args.episode, args.frame
+            )
+        else:
+            depth = record_depths[camera]
         intrinsics = tuple(args.intrinsics) if args.intrinsics else intrinsics_from_fovy(*depth.shape, args.fovy)
         points, pixel_ids = backproject(depth, intrinsics, args.stride, args.min_depth, args.max_depth)
         if camera in poses:
-            points = transform_points(points, load_pose(poses[camera], args.frame))
+            points = transform_points(points, load_pose(poses[camera], pose_frame))
         all_points.append(points)
 
         if not args.no_color:
-            video = (
-                args.dataset_root / "videos" / "chunk-000" / VIDEO_KEYS[camera]
-                / f"episode_{args.episode:06d}.mp4"
-            )
-            rgb = read_video_frame(video, args.frame, depth.shape)
+            if args.dataset_root is not None:
+                video = (
+                    args.dataset_root / "videos" / "chunk-000" / VIDEO_KEYS[camera]
+                    / f"episode_{args.episode:06d}.mp4"
+                )
+                rgb = read_video_frame(video, args.frame, depth.shape)
+            else:
+                rgb_views = record.get("rgb")
+                if not isinstance(rgb_views, dict) or camera not in rgb_views:
+                    parser.error(
+                        f"--record has no current-observation RGB for camera {camera!r}; "
+                        "pass --no-color"
+                    )
+                rgb = resize_record_rgb(rgb_views[camera], depth.shape)
             all_colors.append(rgb.reshape(-1, 3)[pixel_ids])
 
     points = np.concatenate(all_points, axis=0)
+    if not len(points):
+        parser.error("No depth samples remain after filtering.")
     colors = None if args.no_color else np.concatenate(all_colors, axis=0)
     write_ply(args.output, points, colors)
     bounds_min, bounds_max = points.min(axis=0), points.max(axis=0)
     print(f"Wrote {len(points):,} points to {args.output}")
     print(f"bounds min={bounds_min.tolist()} max={bounds_max.tolist()} (metres)")
+    if args.record is not None:
+        print(f"Dream depth horizon: t+{selected_offset}")
+        if not args.no_color:
+            print(
+                "Warning: point colors come from the current observation RGB, "
+                "not a future RGB prediction."
+            )
     if len(args.cameras) == 1 and args.cameras[0] not in poses:
         print("Coordinate frame: camera (x right, y down, z forward)")
     else:

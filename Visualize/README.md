@@ -278,12 +278,37 @@ python Visualize/depth_anything_to_pointcloud.py \
 单相机且不提供位姿时，输出坐标系为相机坐标系：`x` 向右、`y` 向下、
 `z` 向前。
 
+### DreamFastWAM 预测 depth
+
+脚本也可通过 `--record` 直接读取 `replan_XXXX.pt` 中的
+`dream_predictions["depth"]`。使用 `--future-offset` 选择预测时刻：
+
+```bash
+python Visualize/depth_anything_to_pointcloud.py \
+  --record evaluate_results/dream_episode/example/raw_predictions/replan_0000.pt \
+  --future-offset 16 \
+  --cameras image \
+  --fovy 45 \
+  --no-color \
+  --output Visualize/results/dream_depth_t16_image.ply
+```
+
+`--future-offset` 必须是 record 的 `future_offsets` 中存在的值。也可通过
+`--horizon-index 0` 按下标选择，省略这两个参数时默认使用第 0 个 horizon。
+Dream record 没有保存未来 RGB，因此推荐使用 `--no-color`；不加该参数时，
+点的颜色来自当前观测 RGB，并不与未来 depth 严格对应。
+
+主视角和腕部视角的 depth 属于各自相机坐标系。若要通过
+`--cameras image wrist_image` 融合，仍必须用两个 `--pose` 参数提供所选未来
+时刻的 camera-to-world 位姿。
+
 ## 5. 独立 VGGT 双视角几何基线
 
-`vggt_rgb_to_geometry.py` 与 FastWAM 模型完全解耦：它只接收普通 RGB
-图片路径，不读取 DreamFastWAM checkpoint，也不调用 Dream Expert。脚本
-按照官方 VGGT 接口同时输入主视角和腕部视角，预测 depth、depth
-confidence、point-map、point confidence，以及相机内外参。
+`vggt_rgb_to_geometry.py` 不读取 DreamFastWAM checkpoint，也不调用 Dream
+Expert。它既可接收普通 RGB 图片路径，也可直接读取 Dream episode 保存的
+`replan_XXXX.pt` 中的 `record["rgb"]`。脚本按照官方 VGGT 接口同时输入主视角
+和腕部视角，预测 depth、depth confidence、point-map、point confidence，
+以及相机内外参。
 
 先安装[官方 VGGT](https://github.com/facebookresearch/vggt)：
 
@@ -302,25 +327,15 @@ python Visualize/vggt_rgb_to_geometry.py \
   --output-dir Visualize/results/vggt_pair
 ```
 
-如果 RGB 来自 Dream episode 可视化保存的某次 replan，可先把它们导出为
-普通图片；VGGT 脚本本身仍不依赖该 `.pt` 格式：
+如果 RGB 来自 Dream episode 保存的某次 replan，可用 `--record` 直接读取
+其中的 `image` 和 `wrist_image`，不需要导出中间 PNG：
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-import torch
-from PIL import Image
-
-record = torch.load(
-    "evaluate_results/dream_episode/example/raw_predictions/replan_0000.pt",
-    map_location="cpu",
-    weights_only=False,
-)
-output = Path("Visualize/results/vggt_inputs/replan_0000")
-output.mkdir(parents=True, exist_ok=True)
-for camera in ("image", "wrist_image"):
-    Image.fromarray(record["rgb"][camera]).save(output / f"{camera}.png")
-PY
+CUDA_VISIBLE_DEVICES=4 \
+python Visualize/vggt_rgb_to_geometry.py \
+  --record evaluate_results/dream_episode/example/raw_predictions/replan_0000.pt \
+  --view-names image wrist_image \
+  --output-dir Visualize/results/vggt_pair
 ```
 
 如果不希望安装 editable package，也可通过 `--vggt-root` 指向官方仓库：
