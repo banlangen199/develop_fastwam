@@ -1,0 +1,19 @@
+defaults:
+  - dream_fastwam
+  - _self_
+
+_target_: fastwam.threshold_runtime.create_threshold_dream_fastwam
+
+action_dream_threshold:
+  enabled: false
+  alpha: 1.0
+  warmup_ratio: 0.1
+  head_reduce: mean
+  action_query_reduce: max
+  min_keep_dream_tokens: 0
+  detach_selection_score: true
+  log_statistics: true
+  save_detailed_tensors: false
+
+finetune_action_only: false
+

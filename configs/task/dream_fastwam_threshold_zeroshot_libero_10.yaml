@@ -1,0 +1,23 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_10_2cam
+  - override /model: dream_fastwam_action_threshold
+  - _self_
+
+output_dir: ./runs/dream_fastwam_threshold_zeroshot_libero_10/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+model:
+  # No optimizer is created during zero-shot evaluation.  This flag makes any
+  # optional loss probe report L_action only, matching the fine-tuning stage.
+  finetune_action_only: true
+  action_dream_threshold:
+    enabled: true
+    alpha: 1.0
+    warmup_ratio: 0.0
+    head_reduce: mean
+    action_query_reduce: max
+    min_keep_dream_tokens: 0
+    detach_selection_score: true
+    log_statistics: true
+    save_detailed_tensors: false

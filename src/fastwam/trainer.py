@@ -56,6 +56,7 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+        self._weight_checkpoint_loaded_before_optimizer = False
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -85,6 +86,14 @@ class Wan22Trainer:
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
+
+        # A weight-only checkpoint must be loaded before AdamW/DeepSpeed creates
+        # its FP32 master parameters. Loading it after ``accelerator.prepare``
+        # updates only the model copy; the first optimizer step can then copy
+        # stale, randomly initialized master weights back into the model.
+        # Full training-state directories are deliberately handled later, after
+        # prepare, because Accelerate needs the wrapped optimizer to restore them.
+        self._load_weight_checkpoint_before_optimizer()
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
@@ -269,6 +278,8 @@ class Wan22Trainer:
         resume = self.resume
         if not resume:
             return
+        if self._weight_checkpoint_loaded_before_optimizer:
+            return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
             logger.info("Resuming full training state from directory: %s", resume)
@@ -276,9 +287,31 @@ class Wan22Trainer:
             return
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
-        logger.info("Loading weight checkpoint only: %s", resume)
-        self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
-        logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        raise RuntimeError(
+            "Internal checkpoint ordering error: a weight-only checkpoint reached "
+            "post-prepare resume handling without being preloaded."
+        )
+
+    def _load_weight_checkpoint_before_optimizer(self):
+        """Load a file checkpoint before optimizer master parameters are built."""
+        resume = self.resume
+        if not resume:
+            return
+        resume_path = Path(str(resume))
+        if resume_path.is_dir():
+            return
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
+        logger.info(
+            "Preloading weight checkpoint before optimizer/DeepSpeed initialization: %s",
+            resume,
+        )
+        self.model.load_checkpoint(str(resume_path), optimizer=None)
+        self._weight_checkpoint_loaded_before_optimizer = True
+        logger.info(
+            "Weight checkpoint preload complete; optimizer master parameters will be "
+            "initialized from the loaded model weights. Optimizer/scheduler/step are fresh."
+        )
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.

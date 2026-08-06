@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_goal_2cam
+  - override /model: dream_fastwam_action_threshold
+  - _self_
+
+output_dir: ./runs/dream_fastwam_threshold_zeroshot_libero_goal/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+data:
+  train:
+    pretrained_norm_stats: runs/dream_fastwam_libero_goal/2026-08-03_09-01-44_8756/dataset_stats.json
+
+model:
+  # Evaluation creates no optimizer. This selects the Action-only loss probe.
+  finetune_action_only: true
+  dream_query_config:
+    dream_decoder:
+      depth:
+        patch_size: 2
+        target_shape: [8192, 4]
+  action_dream_threshold:
+    enabled: true
+    alpha: 1.0
+    warmup_ratio: 0.0
+    head_reduce: mean
+    action_query_reduce: max
+    min_keep_dream_tokens: 0
+    detach_selection_score: true
+    log_statistics: true
+    save_detailed_tensors: false
+

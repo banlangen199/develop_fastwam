@@ -1,0 +1,29 @@
+checkpoint: runs/dream_fastwam_libero_goal/2026-08-03_09-01-44_8756/checkpoints/weights/step_001656.pt
+dataset_stats_path: runs/dream_fastwam_libero_goal/2026-08-03_09-01-44_8756/dataset_stats.json
+hydra_task: dream_fastwam_libero_goal
+output_dir: action_dream_alpha/outputs/libero_goal_dense_step_001656_seed42
+device: cuda
+seed: 42
+tiled: false
+
+calibration:
+  episode_ratio: 0.1
+  max_episodes_per_task: 5
+  observations_per_episode: 8
+
+profile:
+  num_inference_steps: 20
+  diffusion_step_indices: [0, 4, 9, 14, 19]
+  attention_layers: all
+
+paired_loss:
+  noise_repeats: 3
+
+alpha_values: [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+selection:
+  min_mass_retention: 0.95
+  max_relative_action_loss_delta: 0.01
+  objective: min_mean_k
+  k_zero_ratio_used_for_selection: false
+
