@@ -36,6 +36,11 @@ class Wan22Trainer:
         self.weight_decay = float(cfg.weight_decay)
         self.batch_size = int(cfg.batch_size)
         self.num_workers = int(cfg.num_workers)
+        # CUDA availability alone does not guarantee that page-locked host
+        # allocation works (for example in some containers or large video
+        # batches). Keep it opt-in so DataLoader does not fail in its pinning
+        # thread before the first training step.
+        self.pin_memory = bool(cfg.get("pin_memory", False))
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
@@ -82,6 +87,11 @@ class Wan22Trainer:
             self.max_grad_norm,
         )
         logger.info("using accelerator.device=%s", self.accelerator.device)
+        logger.info(
+            "DataLoader settings: num_workers=%d pin_memory=%s",
+            self.num_workers,
+            self.pin_memory,
+        )
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
@@ -189,7 +199,7 @@ class Wan22Trainer:
             shuffle=False,
             sampler=self.train_sampler,
             num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=self.pin_memory,
             worker_init_fn=worker_init_fn,
         )
 

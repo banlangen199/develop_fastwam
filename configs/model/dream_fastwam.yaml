@@ -129,6 +129,6 @@ loss:
   lambda_video: 1.0
   lambda_dream: 0.1
   lambda_dyn: 1.0
-  lambda_depth: 1.0
+  lambda_depth: 10.0
   lambda_dino: 1.0
   lambda_sam: 1.0

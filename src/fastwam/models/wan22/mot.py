@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -465,6 +465,221 @@ class MoT(nn.Module):
                 scale_mlp=scale_mlp,
                 gate_mlp=gate_mlp,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=action_context_payload,
+            )
+        return x
+
+    def prefill_video_dream_cache(
+        self,
+        video_tokens: torch.Tensor,
+        dream_tokens: torch.Tensor,
+        video_freqs: torch.Tensor,
+        dream_freqs: torch.Tensor,
+        video_t_mod: torch.Tensor,
+        dream_t_mod: torch.Tensor,
+        video_context_payload: Optional[dict],
+        dream_context_payload: Optional[dict],
+        context_attention_mask: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Run the action-independent Video+Dream prefix once and cache its K/V.
+
+        DreamFastWAM's mask makes Video and Dream independent of Action.  Their
+        layer states can therefore be advanced once, while the K/V produced at
+        each layer are reused by every Action denoising step.
+        """
+        if "video" not in self.mixtures or "dream" not in self.mixtures:
+            raise ValueError("MoT requires both 'video' and 'dream' experts for context prefill.")
+        if self.expert_order[:2] != ["video", "dream"]:
+            raise ValueError(
+                "Video+Dream cache requires expert order to start with ['video', 'dream']; "
+                f"got {self.expert_order}."
+            )
+
+        seq_lens = {
+            "video": int(video_tokens.shape[1]),
+            "dream": int(dream_tokens.shape[1]),
+        }
+        context_seq_len = seq_lens["video"] + seq_lens["dream"]
+        if context_attention_mask.ndim != 2 or tuple(context_attention_mask.shape) != (
+            context_seq_len,
+            context_seq_len,
+        ):
+            raise ValueError(
+                "`context_attention_mask` must have shape "
+                f"[{context_seq_len},{context_seq_len}], got {tuple(context_attention_mask.shape)}."
+            )
+
+        tokens_all = {"video": video_tokens, "dream": dream_tokens}
+        freqs_all = {"video": video_freqs, "dream": dream_freqs}
+        t_mod_all = {"video": video_t_mod, "dream": dream_t_mod}
+        context_all = {
+            "video": video_context_payload,
+            "dream": dream_context_payload,
+        }
+        kv_cache: list[dict[str, torch.Tensor]] = []
+
+        for layer_idx in range(self.num_layers):
+            q_chunks = []
+            k_chunks = []
+            v_chunks = []
+            layer_inputs = {}
+            for name in ("video", "dream"):
+                expert = self.mixtures[name]
+                block = expert.blocks[layer_idx]
+                io = self._build_expert_attention_io(
+                    expert=expert,
+                    block=block,
+                    x=tokens_all[name],
+                    freqs=freqs_all[name],
+                    t_mod=t_mod_all[name],
+                )
+                q, k, v, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, use_gc = io
+                q_chunks.append(q)
+                k_chunks.append(k)
+                v_chunks.append(v)
+                layer_inputs[name] = {
+                    "block": block,
+                    "residual_x": residual_x,
+                    "gate_msa": gate_msa,
+                    "shift_mlp": shift_mlp,
+                    "scale_mlp": scale_mlp,
+                    "gate_mlp": gate_mlp,
+                    "use_gradient_checkpointing": use_gc,
+                }
+
+            q_context = torch.cat(q_chunks, dim=1)
+            k_context = torch.cat(k_chunks, dim=1)
+            v_context = torch.cat(v_chunks, dim=1)
+            mixed = self._mixed_attention(
+                q_cat=q_context,
+                k_cat=k_context,
+                v_cat=v_context,
+                attention_mask=context_attention_mask,
+            )
+
+            start = 0
+            for name in ("video", "dream"):
+                end = start + seq_lens[name]
+                item = layer_inputs[name]
+                tokens_all[name] = self._apply_post_with_optional_checkpoint(
+                    block=item["block"],
+                    residual_x=item["residual_x"],
+                    gate_msa=item["gate_msa"],
+                    shift_mlp=item["shift_mlp"],
+                    scale_mlp=item["scale_mlp"],
+                    gate_mlp=item["gate_mlp"],
+                    use_gradient_checkpointing=item["use_gradient_checkpointing"],
+                    mixed_slice=mixed[:, start:end],
+                    context_payload=context_all[name],
+                )
+                start = end
+            kv_cache.append({"k": k_context, "v": v_context})
+
+        return {
+            "kv_cache": kv_cache,
+            "tokens": tokens_all,
+            "seq_lens": seq_lens,
+        }
+
+    def _action_attention_with_context_cache(
+        self,
+        *,
+        q_action: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        attention_mask: torch.Tensor,
+        action_slice: slice,
+        context_slices: dict[str, slice],
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """Extension point for cached Action attention variants."""
+        del context_slices, layer_idx
+        return self._mixed_attention(
+            q_cat=q_action,
+            k_cat=k_all,
+            v_cat=v_all,
+            attention_mask=attention_mask[action_slice, :],
+        )
+
+    def forward_action_with_context_cache(
+        self,
+        action_tokens: torch.Tensor,
+        action_freqs: torch.Tensor,
+        action_t_mod: torch.Tensor,
+        action_context_payload: Optional[dict],
+        context_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        dream_seq_len: int,
+    ) -> torch.Tensor:
+        """Run Action only, attending to cached Video+Dream K/V at every layer."""
+        if "action" not in self.mixtures:
+            raise ValueError("MoT requires an 'action' expert for cached Action forward.")
+        if self.expert_order[-1] != "action":
+            raise ValueError(
+                f"Cached Action forward requires Action to be the final expert; got {self.expert_order}."
+            )
+        if len(context_kv_cache) != self.num_layers:
+            raise ValueError(
+                f"`context_kv_cache` must contain {self.num_layers} layers, got {len(context_kv_cache)}."
+            )
+
+        video_seq_len = int(video_seq_len)
+        dream_seq_len = int(dream_seq_len)
+        context_seq_len = video_seq_len + dream_seq_len
+        action_seq_len = int(action_tokens.shape[1])
+        total_seq_len = context_seq_len + action_seq_len
+        if attention_mask.ndim != 2 or tuple(attention_mask.shape) != (total_seq_len, total_seq_len):
+            raise ValueError(
+                f"`attention_mask` must have shape [{total_seq_len},{total_seq_len}], "
+                f"got {tuple(attention_mask.shape)}."
+            )
+
+        context_slices = {
+            "video": slice(0, video_seq_len),
+            "dream": slice(video_seq_len, context_seq_len),
+        }
+        action_slice = slice(context_seq_len, total_seq_len)
+        expert = self.mixtures["action"]
+        x = action_tokens
+        for layer_idx in range(self.num_layers):
+            block = expert.blocks[layer_idx]
+            io = self._build_expert_attention_io(
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=action_freqs,
+                t_mod=action_t_mod,
+            )
+            q_action, k_action, v_action, residual_x, gate_msa, shift_mlp, scale_mlp, gate_mlp, use_gc = io
+            layer_cache = context_kv_cache[layer_idx]
+            if "k" not in layer_cache or "v" not in layer_cache:
+                raise ValueError(f"`context_kv_cache[{layer_idx}]` must contain `k` and `v`.")
+            k_context = layer_cache["k"]
+            v_context = layer_cache["v"]
+            if k_context.shape[1] != context_seq_len or v_context.shape[1] != context_seq_len:
+                raise ValueError(
+                    f"`context_kv_cache[{layer_idx}]` seq len mismatch, expected {context_seq_len}."
+                )
+
+            mixed = self._action_attention_with_context_cache(
+                q_action=q_action,
+                k_all=torch.cat([k_context, k_action], dim=1),
+                v_all=torch.cat([v_context, v_action], dim=1),
+                attention_mask=attention_mask,
+                action_slice=action_slice,
+                context_slices=context_slices,
+                layer_idx=layer_idx,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gc,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
             )

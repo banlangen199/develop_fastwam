@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from fastwam.utils.logging_config import get_logger
 
-from .fastwam_joint import FastWAMJoint
+from .joint import FastWAMJoint
 
 logger = get_logger(__name__)
 

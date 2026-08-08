@@ -41,7 +41,8 @@ class _FakeDreamInference:
     infer_action_scheduler = _FakeScheduler()
 
     def __init__(self):
-        self.return_dream_calls = []
+        self.prefill_return_dream_calls = []
+        self.cached_action_calls = 0
 
     def eval(self):
         return self
@@ -52,12 +53,16 @@ class _FakeDreamInference:
     def encode_prompt(self, _prompt):
         return torch.zeros((1, 2, 4)), torch.ones((1, 2), dtype=torch.bool)
 
-    def _predict_action_noise(self, *, latents_action, return_dream, **_):
-        self.return_dream_calls.append(bool(return_dream))
-        action = torch.zeros_like(latents_action)
+    def _prefill_video_dream_cache(self, *, return_dream, **_):
+        self.prefill_return_dream_calls.append(bool(return_dream))
+        dream_predictions = None
         if return_dream:
-            return action, {"depth": torch.ones((1, 2, 8, 4))}
-        return action
+            dream_predictions = {"depth": torch.ones((1, 2, 8, 4))}
+        return {"dream_predictions": dream_predictions}
+
+    def _predict_action_noise_with_cache(self, *, latents_action, **_):
+        self.cached_action_calls += 1
+        return torch.zeros_like(latents_action)
 
 
 def test_infer_action_decodes_dream_only_once():
@@ -70,7 +75,8 @@ def test_infer_action_decodes_dream_only_once():
         num_inference_steps=3,
         return_dream_predictions=True,
     )
-    assert fake.return_dream_calls == [True, False, False]
+    assert fake.prefill_return_dream_calls == [True]
+    assert fake.cached_action_calls == 3
     assert output["future_offsets"] == [16, 32]
     assert output["camera_token_split"] == [9, 9]
     assert output["dream_predictions"]["depth"].shape == (2, 8, 4)
@@ -85,7 +91,8 @@ def test_default_infer_action_does_not_run_dream_decoder():
         action_horizon=4,
         num_inference_steps=3,
     )
-    assert fake.return_dream_calls == [False, False, False]
+    assert fake.prefill_return_dream_calls == [False]
+    assert fake.cached_action_calls == 3
     assert set(output) == {"action"}
 
 

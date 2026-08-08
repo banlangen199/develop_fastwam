@@ -1,6 +1,6 @@
 import torch
 
-from fastwam.models.wan22.dream_query_expert import DenseDreamDecoder, DreamQueryExpert
+from fastwam.models.wan22.dream_fastwam import DenseDreamDecoder, DreamQueryExpert
 
 
 def _decoder(target_shape, target_layout):

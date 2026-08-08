@@ -4,7 +4,7 @@ import torch
 
 from fastwam.utils.logging_config import get_logger
 
-from .fastwam import FastWAM
+from .model import FastWAM
 
 logger = get_logger(__name__)
 

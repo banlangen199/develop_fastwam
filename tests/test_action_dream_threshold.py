@@ -115,6 +115,58 @@ def test_enabled_false_and_alpha_zero_match_original_dense_output():
         torch.testing.assert_close(zero_out[name], dense_out[name], rtol=0, atol=0)
 
 
+def _cached_action_forward(mot, args):
+    embeds, freqs, t_mod, context, mask = args
+    video_len = int(embeds["video"].shape[1])
+    dream_len = int(embeds["dream"].shape[1])
+    context_len = video_len + dream_len
+    prefill = mot.prefill_video_dream_cache(
+        video_tokens=embeds["video"],
+        dream_tokens=embeds["dream"],
+        video_freqs=freqs["video"],
+        dream_freqs=freqs["dream"],
+        video_t_mod=t_mod["video"],
+        dream_t_mod=t_mod["dream"],
+        video_context_payload=context["video"],
+        dream_context_payload=context["dream"],
+        context_attention_mask=mask[:context_len, :context_len],
+    )
+    action = mot.forward_action_with_context_cache(
+        action_tokens=embeds["action"],
+        action_freqs=freqs["action"],
+        action_t_mod=t_mod["action"],
+        action_context_payload=context["action"],
+        context_kv_cache=prefill["kv_cache"],
+        attention_mask=mask,
+        video_seq_len=video_len,
+        dream_seq_len=dream_len,
+    )
+    return prefill, action
+
+
+def test_video_dream_cache_matches_full_dense_mot():
+    mot = MoT(make_mixtures(), mot_checkpoint_mixed_attn=False).eval()
+    args = make_inputs(batch_size=1)
+    full = mot(args[0], args[4], args[1], args[3], args[2])
+    prefill, action = _cached_action_forward(mot, args)
+    torch.testing.assert_close(prefill["tokens"]["video"], full["video"], rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(prefill["tokens"]["dream"], full["dream"], rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(action, full["action"], rtol=2e-5, atol=2e-6)
+
+
+def test_video_dream_cache_preserves_action_dream_threshold():
+    mixtures = make_mixtures()
+    dense = MoT(copy.deepcopy(mixtures), mot_checkpoint_mixed_attn=False).eval()
+    threshold = make_threshold_mot(copy.deepcopy(mixtures), alpha=1.0e6).eval()
+    threshold.load_state_dict(dense.state_dict(), strict=True)
+    args = make_inputs(batch_size=1)
+    full_threshold = threshold(args[0], args[4], args[1], args[3], args[2])["action"]
+    _, cached_threshold = _cached_action_forward(threshold, args)
+    _, cached_dense = _cached_action_forward(dense, args)
+    torch.testing.assert_close(cached_threshold, full_threshold, rtol=2e-5, atol=2e-6)
+    assert not torch.equal(cached_threshold, cached_dense)
+
+
 def test_dense_softmax_uses_all_valid_sources_and_sums_to_one():
     mot = make_threshold_mot()
     torch.manual_seed(1)

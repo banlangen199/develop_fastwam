@@ -5,11 +5,11 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
-from .action_dit import ActionDiT
+from ..action_dit import ActionDiT
 from .dream_query_expert import DreamQueryExpert
-from .fastwam import FastWAM
-from .helpers.loader import load_wan22_ti2v_5b_components
-from .mot import MoT
+from ..fastwam.model import FastWAM
+from ..helpers.loader import load_wan22_ti2v_5b_components
+from ..mot import MoT
 from fastwam.utils.logging_config import get_logger
 
 
@@ -848,9 +848,8 @@ class DreamFastWAM(FastWAM):
         fuse_vae_embedding_in_latents: bool,
         return_dream: bool = False,
     ):
-        # Correctness-first DreamFastWAM inference: run full video+dream+action MoT
-        # each step. Later this can be optimized with prefill_video_dream_cache and
-        # forward_action_with_context_cache.
+        # Full-MoT reference path, retained for joint prediction and cache
+        # equivalence checks. `infer_action` uses the optimized cache path.
         timestep_video = torch.zeros_like(timestep_action, dtype=first_frame_latents.dtype, device=self.device)
         joint_out = self._predict_joint_noise(
             latents_video=first_frame_latents,
@@ -867,6 +866,108 @@ class DreamFastWAM(FastWAM):
         if return_dream:
             return pred_action, joint_out[2]
         return pred_action
+
+    @torch.no_grad()
+    def _prefill_video_dream_cache(
+        self,
+        first_frame_latents: torch.Tensor,
+        action_seq_len: int,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_vae_embedding_in_latents: bool,
+        return_dream: bool = False,
+    ) -> dict[str, Any]:
+        """Run the action-independent Video and Dream branches once."""
+        timestep_video = torch.zeros(
+            (first_frame_latents.shape[0],),
+            dtype=first_frame_latents.dtype,
+            device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+        )
+        dream_pre = self.dream_expert.pre_dit(
+            batch_size=first_frame_latents.shape[0],
+            device=video_pre["tokens"].device,
+            dtype=video_pre["tokens"].dtype,
+            context=context,
+            context_mask=context_mask,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        dream_seq_len = int(dream_pre["tokens"].shape[1])
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            dream_seq_len=dream_seq_len,
+            action_seq_len=int(action_seq_len),
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+        context_seq_len = video_seq_len + dream_seq_len
+        prefill = self.mot.prefill_video_dream_cache(
+            video_tokens=video_pre["tokens"],
+            dream_tokens=dream_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            dream_freqs=dream_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            dream_t_mod=dream_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            dream_context_payload={
+                "context": dream_pre["context"],
+                "mask": dream_pre["context_mask"],
+            },
+            context_attention_mask=attention_mask[:context_seq_len, :context_seq_len],
+        )
+        dream_predictions = None
+        if return_dream:
+            dream_predictions = self.dream_expert.post_dit(
+                prefill["tokens"]["dream"],
+                dream_pre,
+            )
+        return {
+            "kv_cache": prefill["kv_cache"],
+            "attention_mask": attention_mask,
+            "video_seq_len": video_seq_len,
+            "dream_seq_len": dream_seq_len,
+            "dream_predictions": dream_predictions,
+        }
+
+    @torch.no_grad()
+    def _predict_action_noise_with_cache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_dream_cache: dict[str, Any],
+    ) -> torch.Tensor:
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        action_tokens = self.mot.forward_action_with_context_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            context_kv_cache=video_dream_cache["kv_cache"],
+            attention_mask=video_dream_cache["attention_mask"],
+            video_seq_len=video_dream_cache["video_seq_len"],
+            dream_seq_len=video_dream_cache["dream_seq_len"],
+        )
+        return self.action_expert.post_dit(action_tokens, action_pre)
 
     @torch.no_grad()
     def infer_action(
@@ -961,29 +1062,31 @@ class DreamFastWAM(FastWAM):
                 proprio=proprio,
             )
 
+        video_dream_cache = self._prefill_video_dream_cache(
+            first_frame_latents=first_frame_latents,
+            action_seq_len=latents_action.shape[1],
+            context=context,
+            context_mask=context_mask,
+            fuse_vae_embedding_in_latents=fuse_flag,
+            return_dream=return_dream_predictions,
+        )
+
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        dream_predictions = None
+        dream_predictions = video_dream_cache["dream_predictions"]
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-            capture_dream = bool(return_dream_predictions and dream_predictions is None)
-            noise_out = self._predict_action_noise(
-                first_frame_latents=first_frame_latents,
+            pred_action = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
-                fuse_vae_embedding_in_latents=fuse_flag,
-                return_dream=capture_dream,
+                video_dream_cache=video_dream_cache,
             )
-            if capture_dream:
-                pred_action, dream_predictions = noise_out
-            else:
-                pred_action = noise_out
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
         output = {"action": latents_action[0].detach().to(device="cpu", dtype=torch.float32)}
@@ -1003,10 +1106,3 @@ class DreamFastWAM(FastWAM):
                 else list(self.dream_expert.camera_token_split)
             )
         return output
-
-    @torch.no_grad()
-    def _predict_action_noise_with_cache(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError(
-            "DreamFastWAM inference is currently correctness-first and does not use the FastWAM optimized "
-            "video-cache path. Use `_predict_action_noise`/full MoT forward instead."
-        )

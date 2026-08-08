@@ -7,7 +7,7 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 
-from .wan_video_dit import DiTBlock, precompute_freqs_cis
+from ..wan_video_dit import DiTBlock, precompute_freqs_cis
 from fastwam.utils.logging_config import get_logger
 
 

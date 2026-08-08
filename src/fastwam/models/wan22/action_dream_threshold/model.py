@@ -8,10 +8,10 @@ import torch.nn.functional as F
 
 from fastwam.utils.logging_config import get_logger
 
-from .dream_fastwam import DreamFastWAM
-from .fastwam import FastWAM
-from .mot import MoT
-from .wan_video_dit import flash_attention
+from ..dream_fastwam.model import DreamFastWAM
+from ..fastwam.model import FastWAM
+from ..mot import MoT
+from ..wan_video_dit import flash_attention
 
 
 logger = get_logger(__name__)
@@ -491,6 +491,68 @@ class ActionDreamThresholdMoT(MoT):
             return result
         return tokens_all
 
+    def forward_action_with_context_cache(self, *args, **kwargs) -> torch.Tensor:
+        self._cached_threshold_records: list[dict[str, Any]] = []
+        output = super().forward_action_with_context_cache(*args, **kwargs)
+        self.last_threshold_statistics = self._cached_threshold_records
+        del self._cached_threshold_records
+        return output
+
+    def _action_attention_with_context_cache(
+        self,
+        *,
+        q_action: torch.Tensor,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        attention_mask: torch.Tensor,
+        action_slice: slice,
+        context_slices: dict[str, slice],
+        layer_idx: int,
+    ) -> torch.Tensor:
+        cfg = self.threshold_config
+        alpha = self.current_alpha()
+        if not cfg.enabled or (alpha <= 0.0 and cfg.min_keep_dream_tokens == 0):
+            return super()._action_attention_with_context_cache(
+                q_action=q_action,
+                k_all=k_all,
+                v_all=v_all,
+                attention_mask=attention_mask,
+                action_slice=action_slice,
+                context_slices=context_slices,
+                layer_idx=layer_idx,
+            )
+
+        action_result = self._threshold_action_attention(
+            q_action=q_action,
+            k_all=k_all,
+            v_all=v_all,
+            attention_mask=attention_mask,
+            action_slice=action_slice,
+            dream_slice=context_slices["dream"],
+            alpha=alpha,
+        )
+        action_out, score, keep, n_valid, dense_mass, kept_mass, pruned_mass = action_result
+        collect_statistics = bool(
+            cfg.save_detailed_tensors
+            or (cfg.log_statistics and self._collect_training_statistics)
+        )
+        if collect_statistics:
+            slices = dict(context_slices)
+            slices["action"] = action_slice
+            self._cached_threshold_records.append(self._record_statistics(
+                layer_idx=layer_idx,
+                alpha=alpha,
+                slices=slices,
+                score=score,
+                keep=keep,
+                n_valid=n_valid,
+                dense_mass=dense_mass,
+                kept_mass=kept_mass,
+                pruned_mass=pruned_mass,
+                detailed=bool(cfg.save_detailed_tensors),
+            ))
+        return action_out
+
 
 class ThresholdDreamFastWAM(DreamFastWAM):
     """DreamFastWAM adapter using :class:`ActionDreamThresholdMoT`.
@@ -606,6 +668,16 @@ class ThresholdDreamFastWAM(DreamFastWAM):
         timestep_action = kwargs.get("timestep_action")
         if timestep_action is None and len(args) >= 4:
             timestep_action = args[3]
+        if timestep_action is not None:
+            self._annotate_threshold_timestep(timestep_action)
+        return result
+
+    @torch.no_grad()
+    def _predict_action_noise_with_cache(self, *args, **kwargs):
+        result = super()._predict_action_noise_with_cache(*args, **kwargs)
+        timestep_action = kwargs.get("timestep_action")
+        if timestep_action is None and len(args) >= 2:
+            timestep_action = args[1]
         if timestep_action is not None:
             self._annotate_threshold_timestep(timestep_action)
         return result

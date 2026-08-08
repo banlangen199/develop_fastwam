@@ -7,11 +7,11 @@ from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
 
-from .action_dit import ActionDiT
-from .action_stats import load_action_correlation_stats, sample_action_noise_like
-from .helpers.loader import load_wan22_ti2v_5b_components
-from .mot import MoT
-from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+from ..action_dit import ActionDiT
+from ..action_stats import load_action_correlation_stats, sample_action_noise_like
+from ..helpers.loader import load_wan22_ti2v_5b_components
+from ..mot import MoT
+from ..schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
 
