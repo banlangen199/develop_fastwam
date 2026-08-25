@@ -7,7 +7,10 @@ from action_dream_alpha.calibrate import (
     alpha_metrics,
     build_episode_calibration_split,
     choose_alpha,
+    choose_first_step_reuse_alpha,
     compute_dense_record,
+    first_step_reuse_metrics,
+    resolve_diffusion_step_indices,
     run_summary,
 )
 
@@ -107,6 +110,77 @@ def test_episode_split_is_deterministic_balanced_and_uses_uniform_frames() -> No
         assert frames == [0, 4, 9]
 
 
+def test_all_diffusion_steps_are_resolved_without_sparse_sampling() -> None:
+    assert resolve_diffusion_step_indices("all", 5) == [0, 1, 2, 3, 4]
+    assert resolve_diffusion_step_indices([4, 0, 4, 2], 5) == [0, 2, 4]
+
+
+def test_first_step_reuse_measures_overlap_recall_and_dense_mass() -> None:
+    score = torch.tensor(
+        [[[[0.8, 0.7, 0.1, 0.0]], [[0.9, 0.1, 0.8, 0.0]]]],
+        dtype=torch.float32,
+    )
+    mass = torch.tensor(
+        [[[[0.1, 0.2, 0.3, 0.4]], [[0.4, 0.1, 0.3, 0.2]]]],
+        dtype=torch.float32,
+    )
+    rows = first_step_reuse_metrics(
+        score,
+        mass,
+        0.5,
+        diffusion_step_indices=[0, 19],
+        anchor_step_index=0,
+    )
+    final = rows[-1]
+    assert final["fixed_mean_k"] == 2.0
+    assert final["dynamic_mean_k"] == 2.0
+    assert abs(final["mask_jaccard_micro"] - 1.0 / 3.0) < 1e-6
+    assert final["later_token_recall_micro"] == 0.5
+    assert final["anchor_token_precision_micro"] == 0.5
+    assert final["mean_new_tokens_per_unit"] == 1.0
+    assert abs(final["fixed_mass_retention"] - 0.5) < 1e-6
+    assert abs(final["dynamic_mass_retention"] - 0.7) < 1e-6
+
+
+def test_first_step_selection_uses_recall_mass_and_proxy_loss_constraints() -> None:
+    rows = [
+        {
+            "alpha": 0.2,
+            "anchor_diffusion_step_index": 0,
+            "diffusion_step_index": 19,
+            "fixed_mean_k": 120.0,
+            "fixed_keep_ratio": 0.8,
+            "later_token_recall_micro": 0.99,
+            "fixed_mass_retention": 0.97,
+            "mask_jaccard_micro": 0.9,
+            "mean_new_tokens_per_unit": 1.0,
+        },
+        {
+            "alpha": 0.25,
+            "anchor_diffusion_step_index": 0,
+            "diffusion_step_index": 19,
+            "fixed_mean_k": 100.0,
+            "fixed_keep_ratio": 0.7,
+            "later_token_recall_micro": 0.96,
+            "fixed_mass_retention": 0.92,
+            "mask_jaccard_micro": 0.8,
+            "mean_new_tokens_per_unit": 3.0,
+        },
+    ]
+    selected = choose_first_step_reuse_alpha(
+        rows,
+        {
+            0.2: {"mean_relative_action_loss_delta": 0.002},
+            0.25: {"mean_relative_action_loss_delta": 0.009},
+        },
+        min_later_token_recall=0.95,
+        min_fixed_mass_retention=0.9,
+        max_relative_action_loss_delta=0.01,
+    )
+    assert selected["selected_alpha"] == 0.25
+    assert selected["selection_rule"]["k_zero_ratio_used_for_selection"] is False
+
+
 def test_summary_writes_recommendation_and_diagnostic_k_zero(tmp_path) -> None:
     shard_dir = tmp_path / "profile_shards"
     shard_dir.mkdir()
@@ -116,7 +190,7 @@ def test_summary_writes_recommendation_and_diagnostic_k_zero(tmp_path) -> None:
             [[0.6, 1.6, 2.1], [0.3, 1.3, 1.7]],
         ],
         dtype=torch.float16,
-    )
+    ).unsqueeze(2).expand(-1, -1, 2, -1).clone()
     mass = torch.full_like(score, 0.1)
     torch.save(
         {
@@ -124,7 +198,7 @@ def test_summary_writes_recommendation_and_diagnostic_k_zero(tmp_path) -> None:
             "dream_token_mass": mass,
             "source_mass": torch.tensor(
                 [[[0.3, 0.4, 0.3], [0.2, 0.5, 0.3]], [[0.3, 0.4, 0.3], [0.2, 0.5, 0.3]]]
-            ),
+            ).unsqueeze(2).expand(-1, -1, 2, -1).clone(),
             "probability_sum_error": torch.zeros(2, 2),
             "layer_ids": torch.tensor([0, 1]),
             "diffusion_step_indices": [0, 4],
@@ -139,6 +213,7 @@ def test_summary_writes_recommendation_and_diagnostic_k_zero(tmp_path) -> None:
     cfg = OmegaConf.create(
         {
             "alpha_values": [0.0, 1.0],
+            "profile": {"num_inference_steps": 5},
             "selection": {
                 "min_mass_retention": 0.6,
                 "max_relative_action_loss_delta": 0.01,
@@ -153,3 +228,6 @@ def test_summary_writes_recommendation_and_diagnostic_k_zero(tmp_path) -> None:
     assert recommendation["selection_rule"]["k_zero_ratio_used_for_selection"] is False
     assert (tmp_path / "alpha_sweep.csv").exists()
     assert (tmp_path / "dense_summary.json").exists()
+    assert (tmp_path / "first_step_reuse.csv").exists()
+    assert (tmp_path / "first_step_reuse_per_layer.csv").exists()
+    assert (tmp_path / "recommended_first_step_alpha.json").exists()

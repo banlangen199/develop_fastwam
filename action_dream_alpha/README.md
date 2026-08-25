@@ -4,15 +4,26 @@ This directory contains the complete calibration workflow for the shared,
 non-learned Action-to-Dream threshold `alpha`.
 
 The default experiment uses the dense LIBERO Goal checkpoint. It selects
-calibration observations by episode, profiles dense mixed attention along real
-Action denoising trajectories, performs an offline alpha sweep, measures paired
-Action flow-matching loss with identical noise/timesteps, and recommends the
-smallest mean K satisfying:
+calibration observations by episode, profiles dense mixed attention at every
+step of the same 20-step Action denoising trajectory, performs an offline alpha
+sweep, measures paired Action flow-matching loss with identical noise/timesteps,
+and evaluates two policies separately:
+
+1. a mask recomputed independently at every denoising step;
+2. the layer-wise mask computed at step 0 and reused for all later steps.
+
+The dynamic-mask recommendation chooses the smallest mean K satisfying:
 
 - original Dream attention mass retention >= 95%;
 - mean relative Action-loss increase <= 1%.
 
 `K=0` frequency is saved for diagnosis but is not a selection constraint.
+
+The fixed-step0 analysis additionally checks the minimum later-token recall and
+minimum dense Dream-mass retention over the trajectory. Its recommendation is
+explicitly labelled an **offline candidate**: later scores are measured on the
+dense trajectory, so rollout evaluation is still required after implementing
+causal fixed-mask execution.
 
 ## Run
 
@@ -34,15 +45,46 @@ python action_dream_alpha/calibrate.py --stage summarize
 The default output directory is:
 
 ```text
-action_dream_alpha/outputs/libero_goal_dense_step_001656_seed42/
+action_dream_alpha/outputs/libero_goal_first_step_reuse_step_001656_seed42/
 ```
 
 Important files are `calibration_split.json`, `dense_summary.json`,
 `alpha_sweep.csv`, `paired_action_loss.csv`, `per_layer.csv`,
 `per_timestep.csv`, `per_task.csv`, `per_token_group.csv`, and
-`recommended_alpha.json`. Profile shards contain only
+`recommended_alpha.json`. The fixed-step0 reports are:
+
+- `first_step_reuse.csv`: aggregate overlap and mass retention by alpha/step;
+- `first_step_reuse_per_layer.csv`: layer-wise worst cases;
+- `first_step_reuse_per_task.csv`: task-wise stability;
+- `recommended_first_step_alpha.json`: constrained offline candidate and scope;
+- `plots/first_step_reuse_*.png`: mask/mass/K trajectories.
+
+The most important reuse fields are:
+
+- `later_token_recall_micro`: fraction of tokens selected at the current step
+  that were already present in the step-0 mask;
+- `mask_jaccard_micro`: exact set overlap, which may fall when step 0 is a
+  conservative superset;
+- `fixed_mass_retention`: current dense Dream mass covered by the step-0 mask;
+- `mean_new_tokens_per_unit`: later-selected tokens missing from step 0, per
+  sample/layer.
+
+Profile shards contain only
 Dream score, per-token original Dream mass, source mass, and numerical checks;
 the full `[head, Action query, all keys]` probability matrix is never saved.
+
+To add the new reports to an existing profile without running the GPU stages
+again, summarize with that run's resolved config:
+
+```bash
+python action_dream_alpha/calibrate.py \
+  --config action_dream_alpha/outputs/OLD_RUN/resolved_config.yaml \
+  --stage summarize
+```
+
+Before a new run, update `checkpoint`, `dataset_stats_path`, and `output_dir` in
+`libero_goal.yaml`. Do not reuse an output directory after changing the
+checkpoint or profile configuration.
 
 ## Visualize threshold decisions during LIBERO evaluation
 

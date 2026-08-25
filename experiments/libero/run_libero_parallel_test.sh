@@ -245,8 +245,10 @@ run_libero_eval() {
     CKPT=${CKPT:-""}
     export CKPT
     CONFIG=${CONFIG:-""}
+    EVAL_SCRIPT=${EVAL_SCRIPT:-"experiments/libero/eval_libero_single.py"}
     require_non_empty "CKPT"
     require_non_empty "CONFIG"
+    require_non_empty "EVAL_SCRIPT"
     # Normalize CONFIG to task/config_name.yaml
     CONFIG="${CONFIG#configs/}" # delete prefix configs/
     CONFIG="${CONFIG#task/}" # delete prefix task/
@@ -255,6 +257,7 @@ run_libero_eval() {
 
     echo "CKPT: $CKPT"
     echo "CONFIG: $CONFIG"
+    echo "EVAL_SCRIPT: $EVAL_SCRIPT"
     echo "ROOT_DIR: $ROOT_DIR"
     echo "NUM_GPUS: $NUM_GPUS"
     echo "MAX_TASKS_PER_GPU: $MAX_TASKS_PER_GPU"
@@ -337,7 +340,7 @@ run_libero_eval() {
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && conda activate fastwam && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
-            CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
+            CUDA_VISIBLE_DEVICES=$gpu_id python $EVAL_SCRIPT \
             task=$CONFIG ckpt=$CKPT \
             EVALUATION.task_suite_name=$suite EVALUATION.task_id=$task_id gpu_id=$gpu_id \
             EVALUATION.num_trials=$NUM_TRIALS EVALUATION.output_dir=$OUTPUT_DIR $EXTRA_ARGS > \"\$LOG_FILE\" 2>&1; \

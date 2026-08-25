@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_dream_4suite_2cam
+  - override /model: dream_fastwam_action_threshold
+  - _self_
+
+output_dir: ./runs/dream_fastwam_threshold_finetune_libero_4suite/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 16
+num_workers: 4
+lr_scheduler_type: cosine
+learning_rate: 1.0e-5
+num_epochs: 2
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 0
+gradient_accumulation_steps: 1
+weight_decay: 1.0e-2
+resume: runs/dream_fastwam_libero/2026-08-23_10-02-36_14476/checkpoints/weights/step_008680.pt
+freeze_video_expert: true
+
+data:
+  train:
+    pretrained_norm_stats: runs/dream_fastwam_libero/2026-08-23_10-02-36_14476/dataset_stats.json
+    dream_target:
+      target_shapes:
+        depth: [8192, 4]
+      depth:
+        patch_size: 2
+
+model:
+  finetune_action_only: true
+  mot_checkpoint_mixed_attn: true
+  dream_query_config:
+    dream_decoder:
+      depth:
+        patch_size: 2
+        target_shape: [8192, 4]
+  action_dream_threshold:
+    enabled: true
+    alpha: 0.2
+    warmup_ratio: 0
+    head_reduce: mean
+    action_query_reduce: max
+    min_keep_dream_tokens: 0
+    detach_selection_score: true
+    log_statistics: true
+    save_detailed_tensors: false
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.0

@@ -118,6 +118,214 @@ def alpha_metrics(
     }
 
 
+def resolve_diffusion_step_indices(raw: Any, num_inference_steps: int) -> list[int]:
+    """Resolve configured capture positions without silently skipping denoising steps."""
+    total = int(num_inference_steps)
+    if total <= 0:
+        raise ValueError("profile.num_inference_steps must be positive.")
+    if isinstance(raw, str):
+        if raw.strip().lower() != "all":
+            raise ValueError("profile.diffusion_step_indices must be 'all' or a list of integers.")
+        return list(range(total))
+    steps = sorted({int(value) for value in raw})
+    if not steps:
+        raise ValueError("profile.diffusion_step_indices must not be empty.")
+    invalid = [value for value in steps if value < 0 or value >= total]
+    if invalid:
+        raise ValueError(
+            f"diffusion_step_indices must be in [0,{total}), got {invalid}"
+        )
+    return steps
+
+
+def first_step_reuse_metrics(
+    score: torch.Tensor,
+    dream_token_mass: torch.Tensor,
+    alpha: float,
+    *,
+    diffusion_step_indices: Iterable[int] | None = None,
+    anchor_step_index: int = 0,
+) -> list[dict[str, float | int]]:
+    """Evaluate reusing one dense anchor-step mask over a denoising trajectory.
+
+    The time axis is dimension 1 and the Dream-token axis is last. All other
+    axes are treated as independent units (normally sample and Action layer).
+    Attention mass always comes from the dense trajectory; this function does
+    not claim to measure the causal trajectory after pruning is enabled.
+    """
+    if score.shape != dream_token_mass.shape:
+        raise ValueError(
+            f"score/mass shape mismatch: {tuple(score.shape)} vs "
+            f"{tuple(dream_token_mass.shape)}"
+        )
+    if score.ndim < 3:
+        raise ValueError("reuse analysis expects [sample,time,...,dream_token] tensors.")
+    if diffusion_step_indices is None:
+        steps = list(range(int(score.shape[1])))
+    else:
+        steps = [int(value) for value in diffusion_step_indices]
+    if len(steps) != int(score.shape[1]) or len(set(steps)) != len(steps):
+        raise ValueError("diffusion_step_indices must uniquely match the profile time axis.")
+    if int(anchor_step_index) not in steps:
+        raise ValueError(f"anchor step {anchor_step_index} is absent from captured steps {steps}.")
+
+    anchor_position = steps.index(int(anchor_step_index))
+    score = score.float()
+    mass = dream_token_mass.float()
+    anchor_keep = score[:, anchor_position] >= float(alpha)
+    anchor_k = anchor_keep.sum(dim=-1).float()
+
+    def safe_global_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
+        denominator_value = float(denominator.sum().item())
+        if denominator_value == 0.0:
+            return 1.0
+        return float(numerator.sum().item() / denominator_value)
+
+    rows: list[dict[str, float | int]] = []
+    for step_position, step_index in enumerate(steps):
+        dynamic_keep = score[:, step_position] >= float(alpha)
+        dynamic_k = dynamic_keep.sum(dim=-1).float()
+        intersection = anchor_keep & dynamic_keep
+        union = anchor_keep | dynamic_keep
+        new_tokens = dynamic_keep & ~anchor_keep
+
+        intersection_k = intersection.sum(dim=-1).float()
+        union_k = union.sum(dim=-1).float()
+        per_unit_recall = torch.where(
+            dynamic_k > 0,
+            intersection_k / dynamic_k.clamp_min(1.0),
+            torch.ones_like(dynamic_k),
+        )
+        per_unit_jaccard = torch.where(
+            union_k > 0,
+            intersection_k / union_k.clamp_min(1.0),
+            torch.ones_like(union_k),
+        )
+        step_mass = mass[:, step_position]
+        dense_mass = step_mass.sum()
+        fixed_kept_mass = (step_mass * anchor_keep).sum()
+        dynamic_kept_mass = (step_mass * dynamic_keep).sum()
+        rows.append(
+            {
+                "alpha": float(alpha),
+                "anchor_diffusion_step_index": int(anchor_step_index),
+                "diffusion_step_index": int(step_index),
+                "fixed_mean_k": float(anchor_k.mean().item()),
+                "fixed_std_k": float(anchor_k.std(unbiased=False).item()),
+                "fixed_keep_ratio": float(anchor_keep.float().mean().item()),
+                "dynamic_mean_k": float(dynamic_k.mean().item()),
+                "dynamic_std_k": float(dynamic_k.std(unbiased=False).item()),
+                "dynamic_keep_ratio": float(dynamic_keep.float().mean().item()),
+                "mask_jaccard_micro": safe_global_ratio(intersection, union),
+                "later_token_recall_micro": safe_global_ratio(intersection, dynamic_keep),
+                "anchor_token_precision_micro": safe_global_ratio(intersection, anchor_keep),
+                "mean_new_tokens_per_unit": float(new_tokens.sum(dim=-1).float().mean().item()),
+                "new_token_ratio_of_dynamic": safe_global_ratio(new_tokens, dynamic_keep),
+                "per_unit_recall_q10": float(torch.quantile(per_unit_recall.flatten(), 0.1).item()),
+                "per_unit_recall_q50": float(torch.quantile(per_unit_recall.flatten(), 0.5).item()),
+                "per_unit_recall_below_0_9_ratio": float(
+                    (per_unit_recall < 0.9).float().mean().item()
+                ),
+                "per_unit_recall_below_0_8_ratio": float(
+                    (per_unit_recall < 0.8).float().mean().item()
+                ),
+                "per_unit_jaccard_q10": float(
+                    torch.quantile(per_unit_jaccard.flatten(), 0.1).item()
+                ),
+                "dense_dream_mass": float(dense_mass.item()),
+                "fixed_kept_dense_dream_mass": float(fixed_kept_mass.item()),
+                "fixed_mass_retention": float(
+                    (fixed_kept_mass / dense_mass.clamp_min(1e-12)).item()
+                ),
+                "dynamic_kept_dense_dream_mass": float(dynamic_kept_mass.item()),
+                "dynamic_mass_retention": float(
+                    (dynamic_kept_mass / dense_mass.clamp_min(1e-12)).item()
+                ),
+            }
+        )
+    return rows
+
+
+def choose_first_step_reuse_alpha(
+    rows: Iterable[dict[str, Any]],
+    paired: dict[float, dict[str, float]],
+    *,
+    min_later_token_recall: float,
+    min_fixed_mass_retention: float,
+    max_relative_action_loss_delta: float,
+) -> dict[str, Any]:
+    """Choose the smallest fixed K satisfying dense-trajectory diagnostics."""
+    by_alpha: dict[float, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_alpha[float(row["alpha"])].append(dict(row))
+    candidates = []
+    summaries = []
+    for alpha, alpha_rows in sorted(by_alpha.items()):
+        later_rows = [
+            row
+            for row in alpha_rows
+            if int(row["diffusion_step_index"])
+            != int(row["anchor_diffusion_step_index"])
+        ]
+        evaluated = later_rows or alpha_rows
+        loss_delta = paired.get(alpha, {}).get("mean_relative_action_loss_delta")
+        summary = {
+            "alpha": float(alpha),
+            "fixed_mean_k": float(alpha_rows[0]["fixed_mean_k"]),
+            "fixed_keep_ratio": float(alpha_rows[0]["fixed_keep_ratio"]),
+            "min_later_token_recall": min(
+                float(row["later_token_recall_micro"]) for row in evaluated
+            ),
+            "min_fixed_mass_retention": min(
+                float(row["fixed_mass_retention"]) for row in evaluated
+            ),
+            "min_mask_jaccard": min(float(row["mask_jaccard_micro"]) for row in evaluated),
+            "max_mean_new_tokens_per_unit": max(
+                float(row["mean_new_tokens_per_unit"]) for row in evaluated
+            ),
+            "mean_relative_action_loss_delta": (
+                None if loss_delta is None else float(loss_delta)
+            ),
+        }
+        summaries.append(summary)
+        if (
+            alpha > 0.0
+            and loss_delta is not None
+            and math.isfinite(float(loss_delta))
+            and summary["min_later_token_recall"] >= float(min_later_token_recall)
+            and summary["min_fixed_mass_retention"] >= float(min_fixed_mass_retention)
+            and float(loss_delta) <= float(max_relative_action_loss_delta)
+        ):
+            candidates.append(summary)
+    rule = {
+        "min_later_token_recall": float(min_later_token_recall),
+        "min_fixed_mass_retention": float(min_fixed_mass_retention),
+        "max_relative_action_loss_delta": float(max_relative_action_loss_delta),
+        "objective": "min_fixed_mean_k",
+        "k_zero_ratio_used_for_selection": False,
+        "dense_alpha_zero_eligible": False,
+        "action_loss_note": "paired loss uses per-timestep dynamic masks and is a proxy only",
+    }
+    if not candidates:
+        return {
+            "selected_alpha": None,
+            "status": "no_nonzero_candidate_satisfies_constraints",
+            "selection_rule": rule,
+            "candidate_summaries": summaries,
+        }
+    selected = min(
+        candidates,
+        key=lambda row: (float(row["fixed_mean_k"]), -float(row["alpha"])),
+    )
+    return {
+        "selected_alpha": float(selected["alpha"]),
+        "status": "offline_candidate_selected",
+        "selection_rule": rule,
+        "selected_metrics": selected,
+        "candidate_summaries": summaries,
+    }
+
+
 def choose_alpha(
     rows: Iterable[dict[str, Any]],
     *,
@@ -485,11 +693,12 @@ def _profile_one_sample(
         dtype=latents_action.dtype,
         shift_override=None,
     )
-    capture_steps = {int(value) for value in cfg.profile.diffusion_step_indices}
-    if any(value < 0 or value >= len(timesteps) for value in capture_steps):
-        raise ValueError(
-            f"diffusion_step_indices must be in [0,{len(timesteps)}), got {sorted(capture_steps)}"
+    capture_steps = set(
+        resolve_diffusion_step_indices(
+            cfg.profile.diffusion_step_indices,
+            num_inference_steps=len(timesteps),
         )
+    )
     scores = []
     token_masses = []
     source_masses = []
@@ -760,9 +969,109 @@ def _save_plots(output_dir: Path, rows: list[dict[str, Any]]) -> None:
         plt.close()
 
 
+def _save_first_step_reuse_plots(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+    report_alphas: Iterable[float],
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[alpha-summary] matplotlib unavailable; skipping first-step reuse plots.")
+        return
+    selected = {float(value) for value in report_alphas}
+    available = {float(row["alpha"]) for row in rows}
+    selected &= available
+    if not selected:
+        return
+    plot_dir = output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    for alpha in sorted(selected):
+        alpha_rows = sorted(
+            (row for row in rows if float(row["alpha"]) == alpha),
+            key=lambda row: int(row["diffusion_step_index"]),
+        )
+        steps = [int(row["diffusion_step_index"]) for row in alpha_rows]
+        axes[0].plot(
+            steps,
+            [float(row["later_token_recall_micro"]) for row in alpha_rows],
+            marker="o",
+            label=f"alpha={alpha:g} recall",
+        )
+        axes[0].plot(
+            steps,
+            [float(row["mask_jaccard_micro"]) for row in alpha_rows],
+            marker="x",
+            linestyle="--",
+            label=f"alpha={alpha:g} Jaccard",
+        )
+        axes[1].plot(
+            steps,
+            [float(row["fixed_mass_retention"]) for row in alpha_rows],
+            marker="o",
+            label=f"alpha={alpha:g} fixed mask",
+        )
+        axes[1].plot(
+            steps,
+            [float(row["dynamic_mass_retention"]) for row in alpha_rows],
+            marker="x",
+            linestyle="--",
+            label=f"alpha={alpha:g} dynamic mask",
+        )
+    axes[0].set_xlabel("denoising step")
+    axes[0].set_ylabel("mask overlap")
+    axes[0].set_ylim(0.0, 1.01)
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(fontsize=8)
+    axes[1].set_xlabel("denoising step")
+    axes[1].set_ylabel("dense Dream mass retention")
+    axes[1].set_ylim(0.0, 1.01)
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(plot_dir / "first_step_reuse_overlap_mass.png", dpi=180)
+    plt.close(fig)
+
+    plt.figure(figsize=(7, 4.5))
+    for alpha in sorted(selected):
+        alpha_rows = sorted(
+            (row for row in rows if float(row["alpha"]) == alpha),
+            key=lambda row: int(row["diffusion_step_index"]),
+        )
+        steps = [int(row["diffusion_step_index"]) for row in alpha_rows]
+        plt.plot(
+            steps,
+            [float(row["dynamic_mean_k"]) for row in alpha_rows],
+            marker="o",
+            label=f"alpha={alpha:g} dynamic K",
+        )
+        plt.plot(
+            steps,
+            [float(row["fixed_mean_k"]) for row in alpha_rows],
+            linestyle="--",
+            label=f"alpha={alpha:g} fixed step-0 K",
+        )
+    plt.xlabel("denoising step")
+    plt.ylabel("mean retained Dream tokens")
+    plt.grid(alpha=0.25)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(plot_dir / "first_step_reuse_k.png", dpi=180)
+    plt.close()
+
+
 def run_summary(cfg: DictConfig, output_dir: Path) -> None:
     score, token_mass, source_mass, records = _profile_tensors(output_dir)
     paired = _paired_summary(output_dir)
+    step_indices = [int(value) for value in records[0]["diffusion_step_indices"]]
+    for record in records[1:]:
+        if [int(value) for value in record["diffusion_step_indices"]] != step_indices:
+            raise ValueError("Profile shards do not share the same diffusion-step positions.")
     rows = []
     for alpha in [float(value) for value in cfg.alpha_values]:
         row = alpha_metrics(score, token_mass, alpha)
@@ -807,7 +1116,6 @@ def run_summary(cfg: DictConfig, output_dir: Path) -> None:
     _write_csv(output_dir / "per_layer.csv", per_layer)
 
     per_timestep = []
-    step_indices = records[0]["diffusion_step_indices"]
     for step_position, step_index in enumerate(step_indices):
         step_score = score[:, step_position]
         step_mass = token_mass[:, step_position]
@@ -822,10 +1130,95 @@ def run_summary(cfg: DictConfig, output_dir: Path) -> None:
             per_timestep.append({**base, **alpha_metrics(step_score, step_mass, alpha)})
     _write_csv(output_dir / "per_timestep.csv", per_timestep)
 
-    per_task = []
     task_to_indices: dict[str, list[int]] = defaultdict(list)
     for index, record in enumerate(records):
         task_to_indices[str(record["metadata"]["task"])].append(index)
+
+    reuse_cfg = cfg.get("first_step_reuse_analysis") or {}
+    reuse_enabled = bool(reuse_cfg.get("enabled", True))
+    if reuse_enabled:
+        anchor_step_index = int(reuse_cfg.get("anchor_step_index", 0))
+        reuse_rows = []
+        for alpha in [float(value) for value in cfg.alpha_values]:
+            reuse_rows.extend(
+                first_step_reuse_metrics(
+                    score,
+                    token_mass,
+                    alpha,
+                    diffusion_step_indices=step_indices,
+                    anchor_step_index=anchor_step_index,
+                )
+            )
+        _write_csv(output_dir / "first_step_reuse.csv", reuse_rows)
+
+        reuse_per_layer = []
+        for layer_position, layer_id in enumerate(layer_ids):
+            for alpha in [float(value) for value in cfg.alpha_values]:
+                layer_rows = first_step_reuse_metrics(
+                    score[:, :, layer_position],
+                    token_mass[:, :, layer_position],
+                    alpha,
+                    diffusion_step_indices=step_indices,
+                    anchor_step_index=anchor_step_index,
+                )
+                reuse_per_layer.extend(
+                    {"layer": int(layer_id), **row} for row in layer_rows
+                )
+        _write_csv(output_dir / "first_step_reuse_per_layer.csv", reuse_per_layer)
+
+        reuse_per_task = []
+        for task, indices in sorted(task_to_indices.items()):
+            for alpha in [float(value) for value in cfg.alpha_values]:
+                task_rows = first_step_reuse_metrics(
+                    score[indices],
+                    token_mass[indices],
+                    alpha,
+                    diffusion_step_indices=step_indices,
+                    anchor_step_index=anchor_step_index,
+                )
+                reuse_per_task.extend(
+                    {"task": task, "num_observations": len(indices), **row}
+                    for row in task_rows
+                )
+        _write_csv(output_dir / "first_step_reuse_per_task.csv", reuse_per_task)
+
+        reuse_selection = reuse_cfg.get("selection") or {}
+        reuse_recommendation = choose_first_step_reuse_alpha(
+            reuse_rows,
+            paired,
+            min_later_token_recall=float(
+                reuse_selection.get("min_later_token_recall", 0.95)
+            ),
+            min_fixed_mass_retention=float(
+                reuse_selection.get("min_fixed_mass_retention", 0.90)
+            ),
+            max_relative_action_loss_delta=float(
+                reuse_selection.get(
+                    "max_relative_action_loss_delta",
+                    cfg.selection.max_relative_action_loss_delta,
+                )
+            ),
+        )
+        reuse_recommendation["analysis_scope"] = {
+            "trajectory": "dense_action_denoising",
+            "captured_diffusion_step_indices": step_indices,
+            "all_denoising_steps_captured": step_indices
+            == list(range(int(cfg.profile.num_inference_steps))),
+            "anchor_step_index": anchor_step_index,
+            "causal_fixed_mask_rollout_measured": False,
+            "note": (
+                "Later scores and masses are measured on the paired dense trajectory. "
+                "A real fixed-mask rollout may change later Action latents and attention."
+            ),
+        }
+        _atomic_json(
+            output_dir / "recommended_first_step_alpha.json",
+            reuse_recommendation,
+        )
+        report_alphas = reuse_cfg.get("report_alphas", [0.2, 0.25])
+        _save_first_step_reuse_plots(output_dir, reuse_rows, report_alphas)
+
+    per_task = []
     for task, indices in sorted(task_to_indices.items()):
         task_score = score[indices]
         task_mass = token_mass[indices]
@@ -867,6 +1260,11 @@ def run_summary(cfg: DictConfig, output_dir: Path) -> None:
     _save_plots(output_dir, rows)
     print(f"[alpha-summary] Dense Dream mass={dense_summary['mean_dream_attention_mass']:.6f}")
     print(f"[alpha-summary] recommendation={recommendation['selected_alpha']}")
+    if reuse_enabled:
+        print(
+            "[alpha-summary] fixed-step0 offline candidate="
+            f"{reuse_recommendation['selected_alpha']}"
+        )
 
 
 def main() -> None:
