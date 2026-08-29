@@ -67,22 +67,65 @@ class _Totals:
 
 
 class ThresholdPruningCollector:
-    """Aggregate scalar threshold decisions without retaining attention tensors.
+    """Aggregate threshold decisions and optionally retain proxy tensors.
 
     One layer evaluation means one MoT layer at one Action denoising step for
     one policy replan. LIBERO evaluation uses batch size one, while ``k_mean``
     also keeps the aggregation well-defined if that changes in the future.
     """
 
-    def __init__(self, *, configured_alpha: float, expected_layers: int):
+    _PROXY_SCALAR_FIELDS = (
+        "proxy_head_dim",
+        "full_k_mean",
+        "proxy_k_mean",
+        "proxy_k_delta_mean",
+        "proxy_teacher_recall",
+        "proxy_teacher_precision",
+        "proxy_teacher_jaccard",
+        "proxy_mask_agreement",
+        "proxy_false_negative_mean",
+        "proxy_false_positive_mean",
+        "proxy_score_mae",
+        "proxy_score_rmse",
+        "full_dense_dream_mass",
+        "full_teacher_kept_mass",
+        "proxy_mask_kept_full_mass",
+        "proxy_full_mass_retention",
+    )
+    _PROXY_TENSOR_FIELDS = (
+        "proxy_channel_indices",
+        "full_score",
+        "proxy_score",
+        "full_keep_mask",
+        "proxy_keep_mask",
+        "full_dense_dream_mass_per_sample",
+        "full_teacher_kept_mass_per_sample",
+        "proxy_mask_kept_full_mass_per_sample",
+        "proxy_full_mass_retention_per_sample",
+    )
+
+    def __init__(
+        self,
+        *,
+        configured_alpha: float,
+        expected_layers: int,
+        capture_proxy_tensors: bool = False,
+    ):
         self.configured_alpha = float(configured_alpha)
         self.expected_layers = int(expected_layers)
         if self.expected_layers <= 0:
             raise ValueError("expected_layers must be positive.")
         self.episodes: list[dict[str, Any]] = []
+        self.layer_records: list[dict[str, Any]] = []
+        self.capture_proxy_tensors = bool(capture_proxy_tensors)
+        self.proxy_tensor_records: list[dict[str, Any]] = []
         self._episode_index: int | None = None
         self._episode_replans: list[tuple[dict[str, Any], _Totals]] = []
+        self._episode_layer_records: list[dict[str, Any]] = []
+        self._episode_proxy_tensor_records: list[dict[str, Any]] = []
         self._replan_totals: _Totals | None = None
+        self._replan_layer_records: list[dict[str, Any]] = []
+        self._replan_proxy_tensor_records: list[dict[str, Any]] = []
         self._replan_steps = 0
         self._expected_denoise_steps: int | None = None
 
@@ -91,10 +134,14 @@ class ThresholdPruningCollector:
             raise RuntimeError("Cannot begin an episode while another episode is active.")
         self._episode_index = int(episode_index)
         self._episode_replans = []
+        self._episode_layer_records = []
+        self._episode_proxy_tensor_records = []
 
     def abort_episode(self) -> None:
         self._episode_index = None
         self._episode_replans = []
+        self._episode_layer_records = []
+        self._episode_proxy_tensor_records = []
         self.abort_replan()
 
     def begin_replan(self, *, expected_denoise_steps: int) -> None:
@@ -103,11 +150,15 @@ class ThresholdPruningCollector:
         if self._replan_totals is not None:
             raise RuntimeError("Cannot begin a replan while another replan is active.")
         self._replan_totals = _Totals()
+        self._replan_layer_records = []
+        self._replan_proxy_tensor_records = []
         self._replan_steps = 0
         self._expected_denoise_steps = int(expected_denoise_steps)
 
     def abort_replan(self) -> None:
         self._replan_totals = None
+        self._replan_layer_records = []
+        self._replan_proxy_tensor_records = []
         self._replan_steps = 0
         self._expected_denoise_steps = None
 
@@ -140,6 +191,47 @@ class ThresholdPruningCollector:
                     f"Invalid threshold counts at layer {layer}: kept={kept}, total={total}."
                 )
             self._replan_totals.add(total=total, kept=kept)
+            pruned = total - kept
+            layer_record = {
+                "episode": self._episode_index,
+                "replan": len(self._episode_replans),
+                "denoise_step": self._replan_steps,
+                "layer": layer,
+                "alpha": alpha,
+                "total_dream_tokens": total,
+                "kept_dream_tokens": kept,
+                "pruned_dream_tokens": pruned,
+                "prune_ratio": pruned / total,
+                "k_std": record.get("k_std"),
+                "k_min": record.get("k_min"),
+                "k_max": record.get("k_max"),
+                "reuse_inference_step": record.get("reuse_inference_step"),
+                "mask_refreshed": record.get("mask_refreshed"),
+            }
+            if "proxy_head_dim" in record:
+                layer_record.update(
+                    {field: record.get(field) for field in self._PROXY_SCALAR_FIELDS}
+                )
+            self._replan_layer_records.append(layer_record)
+            if self.capture_proxy_tensors:
+                missing = [field for field in self._PROXY_TENSOR_FIELDS if field not in record]
+                if missing:
+                    raise RuntimeError(
+                        "Proxy tensor capture was requested, but threshold record is missing "
+                        f"{missing}. Enable proxy_analysis_enabled and save_detailed_tensors."
+                    )
+                tensor_record = {
+                    "episode": self._episode_index,
+                    "replan": len(self._episode_replans),
+                    "denoise_step": self._replan_steps,
+                    "layer": layer,
+                    "alpha": alpha,
+                    "proxy_head_dim": record.get("proxy_head_dim"),
+                }
+                tensor_record.update(
+                    {field: record[field] for field in self._PROXY_TENSOR_FIELDS}
+                )
+                self._replan_proxy_tensor_records.append(tensor_record)
         self._replan_steps += 1
 
     def finish_replan(self) -> dict[str, Any]:
@@ -156,6 +248,8 @@ class ThresholdPruningCollector:
             **self._replan_totals.summary(),
         }
         self._episode_replans.append((summary, self._replan_totals))
+        self._episode_layer_records.extend(self._replan_layer_records)
+        self._episode_proxy_tensor_records.extend(self._replan_proxy_tensor_records)
         self.abort_replan()
         return summary
 
@@ -178,8 +272,16 @@ class ThresholdPruningCollector:
             "replan_summaries": [item[0] for item in self._episode_replans],
         }
         self.episodes.append(summary)
+        for record in self._episode_layer_records:
+            record["success"] = bool(success)
+        self.layer_records.extend(self._episode_layer_records)
+        for record in self._episode_proxy_tensor_records:
+            record["success"] = bool(success)
+        self.proxy_tensor_records.extend(self._episode_proxy_tensor_records)
         self._episode_index = None
         self._episode_replans = []
+        self._episode_layer_records = []
+        self._episode_proxy_tensor_records = []
         return summary
 
     def overall_summary(self) -> dict[str, Any]:
@@ -221,7 +323,7 @@ class ThresholdPruningCollector:
 
 
 def instrument_threshold_model(model: Any, collector: ThresholdPruningCollector) -> None:
-    """Attach scalar collection to the cached Action inference path."""
+    """Attach threshold/proxy collection to the cached Action inference path."""
     if getattr(model, "_threshold_pruning_instrumented", False):
         raise RuntimeError("Threshold pruning instrumentation is already installed.")
     mot = getattr(model, "mot", None)
@@ -240,13 +342,12 @@ def instrument_threshold_model(model: Any, collector: ThresholdPruningCollector)
             f"Collector alpha {collector.configured_alpha} does not match runtime alpha {runtime_alpha}."
         )
 
-    # Scalar records are normally training-only. Enabling this flag in eval
-    # changes collection only; the threshold mask and attention output are
-    # exactly the same and detailed tensors remain disabled.
+    # Statistics collection does not change the threshold mask or Action
+    # output. Detailed CPU tensors remain opt-in through the collector.
     mot.threshold_config = replace(
         cfg,
         log_statistics=True,
-        save_detailed_tensors=False,
+        save_detailed_tensors=collector.capture_proxy_tensors,
     )
     mot._collect_training_statistics = True
 

@@ -8,8 +8,10 @@ import torch
 import torch.nn as nn
 
 from fastwam.models.wan22.action_dream_threshold import (
+    ActionDreamThresholdConfig,
     ActionDreamThresholdMoT,
     ThresholdDreamFastWAM,
+    rope_pair_uniform_channel_indices,
 )
 from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.wan_video_dit import DiTBlock, precompute_freqs_cis
@@ -303,6 +305,198 @@ def test_threshold_attention_has_no_nan_in_supported_cpu_dtypes(dtype):
     output = direct_threshold_call(mot, q, k, v, alpha=1.0e6)[0]
     assert output.dtype == dtype
     assert torch.isfinite(output).all()
+
+
+def test_rope_pair_uniform_channels_are_deterministic_and_pair_complete():
+    channels = rope_pair_uniform_channel_indices(128, 16)
+    assert channels.tolist() == [
+        0, 1, 16, 17, 32, 33, 48, 49,
+        64, 65, 80, 81, 96, 97, 112, 113,
+    ]
+    assert channels.numel() == 16
+    assert torch.equal(channels[1::2], channels[::2] + 1)
+    assert bool((channels[::2] % 2 == 0).all())
+
+
+@pytest.mark.parametrize("proxy_head_dim", [0, 3])
+def test_proxy_head_dim_validation_rejects_non_positive_or_odd(proxy_head_dim):
+    with pytest.raises(ValueError, match="proxy_head_dim"):
+        ActionDreamThresholdConfig.from_dict({"proxy_head_dim": proxy_head_dim})
+
+
+def test_proxy_head_dim_must_fit_the_real_attention_head():
+    with pytest.raises(ValueError, match="proxy_head_dim"):
+        make_threshold_mot(proxy_analysis_enabled=True, proxy_head_dim=16)
+
+
+def test_proxy_analysis_does_not_change_real_action_output():
+    torch.manual_seed(17)
+    q = torch.randn(2, 2, 8)
+    k = torch.randn(2, 6, 8)
+    v = torch.randn(2, 6, 8)
+    mask = torch.ones(6, 6, dtype=torch.bool)
+    mask[4, 0] = False
+    teacher_only = make_threshold_mot(proxy_analysis_enabled=False)
+    with_proxy = make_threshold_mot(proxy_analysis_enabled=True, proxy_head_dim=2)
+    teacher_result = direct_threshold_call(teacher_only, q, k, v, alpha=0.9, mask=mask)
+    proxy_result = direct_threshold_call(with_proxy, q, k, v, alpha=0.9, mask=mask)
+    torch.testing.assert_close(proxy_result[0], teacher_result[0], rtol=0, atol=0)
+    torch.testing.assert_close(proxy_result[1], teacher_result[1], rtol=0, atol=0)
+    assert torch.equal(proxy_result[2], teacher_result[2])
+    assert teacher_result[7] is None
+    assert proxy_result[7] is not None
+
+
+def test_proxy_analysis_does_not_change_end_to_end_mot_outputs():
+    mixtures = make_mixtures()
+    teacher = make_threshold_mot(
+        copy.deepcopy(mixtures),
+        alpha=0.9,
+        proxy_analysis_enabled=False,
+    ).eval()
+    proxy = make_threshold_mot(
+        copy.deepcopy(mixtures),
+        alpha=0.9,
+        proxy_analysis_enabled=True,
+        proxy_head_dim=2,
+        save_detailed_tensors=True,
+    ).eval()
+    proxy.load_state_dict(teacher.state_dict(), strict=True)
+    args = make_inputs(batch_size=1)
+    teacher_out = teacher(args[0], args[4], args[1], args[3], args[2])
+    proxy_result = proxy(
+        args[0],
+        args[4],
+        args[1],
+        args[3],
+        args[2],
+        return_threshold_statistics=True,
+    )
+    for name in ("video", "dream", "action"):
+        torch.testing.assert_close(
+            proxy_result["tokens"][name],
+            teacher_out[name],
+            rtol=0,
+            atol=0,
+        )
+    for record in proxy_result["action_dream_threshold"]:
+        assert record["full_score"].shape == (1, 4)
+        assert record["proxy_score"].shape == (1, 4)
+        assert record["full_keep_mask"].shape == (1, 4)
+        assert record["proxy_keep_mask"].shape == (1, 4)
+
+
+def test_full_dimension_proxy_matches_teacher_score_and_mask():
+    torch.manual_seed(19)
+    mot = make_threshold_mot(
+        proxy_analysis_enabled=True,
+        proxy_head_dim=4,
+        save_detailed_tensors=True,
+    )
+    q = torch.randn(2, 2, 8)
+    k = torch.randn(2, 6, 8)
+    v = torch.randn(2, 6, 8)
+    _, score, keep, *_, proxy = direct_threshold_call(mot, q, k, v, alpha=1.0)
+    torch.testing.assert_close(proxy["proxy_score"], score, rtol=0, atol=0)
+    assert torch.equal(proxy["proxy_keep_mask"], keep)
+    assert bool((proxy["teacher_recall"] == 1).all())
+    assert bool((proxy["teacher_precision"] == 1).all())
+    assert bool((proxy["teacher_jaccard"] == 1).all())
+
+
+def test_proxy_uses_full_joint_key_space_and_proxy_scale():
+    torch.manual_seed(23)
+    mot = make_threshold_mot(proxy_analysis_enabled=True, proxy_head_dim=2)
+    q = torch.randn(1, 2, 8)
+    k = torch.randn(1, 6, 8)
+    v = torch.randn(1, 6, 8)
+    mask = torch.ones(6, 6, dtype=torch.bool)
+    mask[4, 0] = False
+    result = direct_threshold_call(mot, q, k, v, alpha=0.7, mask=mask)
+    proxy = result[7]
+    assert proxy["proxy_score"].shape == (1, 2)
+    assert proxy["proxy_keep_mask"].shape == (1, 2)
+
+    qh = q.reshape(1, 2, 2, 4).transpose(1, 2)[..., :2]
+    kh = k.reshape(1, 6, 2, 4).transpose(1, 2)[..., :2]
+    allowed = mask[4:6].view(1, 1, 2, 6).expand(1, 2, 2, 6)
+    logits = qh.float() @ kh.float().transpose(-2, -1) * (2**-0.5)
+    probs = torch.softmax(logits.masked_fill(~allowed, -torch.inf), dim=-1)
+    assert probs[..., :2].sum() > 0
+    assert probs[..., 2:4].sum() > 0
+    assert probs[..., 4:6].sum() > 0
+    n_valid = allowed.sum(dim=-1)[:, 0].float()
+    expected = (probs[..., 2:4] * n_valid[:, None, :, None]).mean(dim=1).amax(dim=1)
+    torch.testing.assert_close(proxy["proxy_score"], expected)
+
+
+def test_proxy_minimum_keep_and_empty_mask_metrics_are_finite():
+    torch.manual_seed(29)
+    q = torch.randn(1, 2, 8)
+    k = torch.randn(1, 6, 8)
+    v = torch.randn(1, 6, 8)
+
+    minimum = make_threshold_mot(
+        proxy_analysis_enabled=True,
+        proxy_head_dim=2,
+        min_keep_dream_tokens=1,
+    )
+    minimum_result = direct_threshold_call(minimum, q, k, v, alpha=1.0e6)
+    assert minimum_result[2].sum().item() == 1
+    assert minimum_result[7]["proxy_keep_mask"].sum().item() == 1
+
+    empty = make_threshold_mot(proxy_analysis_enabled=True, proxy_head_dim=2)
+    proxy = direct_threshold_call(empty, q, k, v, alpha=1.0e6)[7]
+    assert proxy["full_k"].item() == 0
+    assert proxy["proxy_k"].item() == 0
+    for key in (
+        "teacher_recall",
+        "teacher_precision",
+        "teacher_jaccard",
+        "mask_agreement",
+        "score_mae",
+        "score_rmse",
+        "proxy_full_mass_retention",
+    ):
+        assert torch.isfinite(proxy[key]).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_proxy_analysis_has_no_nan_in_supported_cpu_dtypes(dtype):
+    mot = make_threshold_mot(proxy_analysis_enabled=True, proxy_head_dim=2)
+    q = torch.randn(1, 2, 8, dtype=dtype)
+    k = torch.randn(1, 6, 8, dtype=dtype)
+    v = torch.randn(1, 6, 8, dtype=dtype)
+    result = direct_threshold_call(mot, q, k, v, alpha=1.0)
+    assert result[0].dtype == dtype
+    assert torch.isfinite(result[0]).all()
+    proxy = result[7]
+    for value in proxy.values():
+        if isinstance(value, torch.Tensor) and value.dtype is not torch.bool:
+            assert torch.isfinite(value).all()
+
+
+def test_proxy_analysis_supports_training_gradient_checkpointing():
+    mot = ActionDreamThresholdMoT(
+        mixtures=make_mixtures(num_layers=1),
+        mot_checkpoint_mixed_attn=True,
+        action_dream_threshold={
+            "enabled": True,
+            "alpha": 0.8,
+            "warmup_ratio": 0.0,
+            "proxy_analysis_enabled": True,
+            "proxy_head_dim": 2,
+        },
+    ).train()
+    args = make_inputs(batch_size=1)
+    result = mot(args[0], args[4], args[1], args[3], args[2])
+    result["action"].square().mean().backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in mot.mixtures["action"].parameters()
+    )
+    assert len(mot.last_threshold_statistics) == 1
+    assert mot.last_threshold_statistics[0]["proxy_head_dim"] == 2
 
 
 def test_old_mot_checkpoint_keys_are_unchanged_and_no_router_parameters_exist():

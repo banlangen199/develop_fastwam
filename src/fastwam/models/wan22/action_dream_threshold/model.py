@@ -17,6 +17,34 @@ from ..wan_video_dit import flash_attention
 logger = get_logger(__name__)
 
 
+def rope_pair_uniform_channel_indices(
+    full_head_dim: int,
+    proxy_head_dim: int,
+    *,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Select uniformly spaced complete RoPE pairs from one attention head."""
+    full_head_dim = int(full_head_dim)
+    proxy_head_dim = int(proxy_head_dim)
+    if full_head_dim <= 0 or full_head_dim % 2 != 0:
+        raise ValueError(f"full_head_dim must be a positive even integer, got {full_head_dim}.")
+    if proxy_head_dim <= 0 or proxy_head_dim > full_head_dim:
+        raise ValueError(
+            f"proxy_head_dim must be in (0, {full_head_dim}], got {proxy_head_dim}."
+        )
+    if proxy_head_dim % 2 != 0:
+        raise ValueError(f"proxy_head_dim must be even, got {proxy_head_dim}.")
+
+    full_pairs = full_head_dim // 2
+    proxy_pairs = proxy_head_dim // 2
+    pair_indices = torch.div(
+        torch.arange(proxy_pairs, dtype=torch.long, device=device) * full_pairs,
+        proxy_pairs,
+        rounding_mode="floor",
+    )
+    return torch.stack((pair_indices * 2, pair_indices * 2 + 1), dim=-1).flatten()
+
+
 @dataclass(frozen=True)
 class ActionDreamThresholdConfig:
     """Non-parametric policy for Action-to-Dream mixed-attention pruning."""
@@ -30,6 +58,9 @@ class ActionDreamThresholdConfig:
     detach_selection_score: bool = True
     log_statistics: bool = True
     save_detailed_tensors: bool = False
+    proxy_analysis_enabled: bool = False
+    proxy_head_dim: int = 16
+    proxy_channel_sampling: str = "rope_pair_uniform"
 
     @classmethod
     def from_dict(cls, value: Optional[dict[str, Any]]) -> "ActionDreamThresholdConfig":
@@ -49,6 +80,15 @@ class ActionDreamThresholdConfig:
             raise ValueError("min_keep_dream_tokens must be >= 0.")
         if not cfg.detach_selection_score:
             raise ValueError("The hard-threshold implementation requires detach_selection_score=true.")
+        if cfg.proxy_head_dim <= 0:
+            raise ValueError("action_dream_threshold.proxy_head_dim must be positive.")
+        if cfg.proxy_head_dim % 2 != 0:
+            raise ValueError("action_dream_threshold.proxy_head_dim must be even.")
+        if cfg.proxy_channel_sampling != "rope_pair_uniform":
+            raise ValueError(
+                "The proxy implementation supports proxy_channel_sampling="
+                "'rope_pair_uniform' only."
+            )
         return cfg
 
 
@@ -76,6 +116,11 @@ class ActionDreamThresholdMoT(MoT):
         self._threshold_total_steps = 0
         self._collect_training_statistics = False
         self.last_threshold_statistics: list[dict[str, Any]] = []
+        if self.threshold_config.proxy_analysis_enabled:
+            rope_pair_uniform_channel_indices(
+                self.attn_head_dim,
+                self.threshold_config.proxy_head_dim,
+            )
 
     def set_training_progress(
         self,
@@ -225,6 +270,98 @@ class ActionDreamThresholdMoT(MoT):
         dense_mass = dense_dream.sum(dim=-1).mean(dim=(1, 2))
         kept_mass = (dense_dream * keep[:, None, None, :]).sum(dim=-1).mean(dim=(1, 2))
         pruned_mass = pruned_probs[..., dream_slice].sum(dim=-1).mean(dim=(1, 2))
+        proxy_analysis = None
+        if self.threshold_config.proxy_analysis_enabled:
+            # Analysis is deliberately evaluated only after the real Action
+            # output has been computed from the full-dimensional teacher mask.
+            # No proxy tensor participates in ``pruned_allowed`` or action_out.
+            with torch.no_grad():
+                proxy_head_dim = int(self.threshold_config.proxy_head_dim)
+                channels = rope_pair_uniform_channel_indices(
+                    self.attn_head_dim,
+                    proxy_head_dim,
+                    device=q.device,
+                )
+                q_proxy = q.index_select(-1, channels)
+                k_proxy = k.index_select(-1, channels)
+                proxy_logits = torch.matmul(
+                    q_proxy.float(),
+                    k_proxy.float().transpose(-2, -1),
+                )
+                proxy_logits.mul_(proxy_head_dim ** -0.5)
+                proxy_probs = torch.softmax(
+                    proxy_logits.masked_fill(~allowed, -torch.inf),
+                    dim=-1,
+                )
+                if not bool(torch.isfinite(proxy_probs).all()):
+                    raise FloatingPointError(
+                        "Proxy Action mixed-attention probabilities contain NaN/Inf."
+                    )
+                proxy_dream = proxy_probs[..., dream_slice]
+                proxy_normalized = proxy_dream * n_valid[:, None, :, None]
+                proxy_score = proxy_normalized.mean(dim=1).amax(dim=1).detach()
+                proxy_keep = proxy_score >= float(alpha)
+                proxy_keep = self._apply_minimum_keep(proxy_keep, proxy_score)
+
+                full_k = keep.sum(dim=-1)
+                proxy_k = proxy_keep.sum(dim=-1)
+                intersection = keep & proxy_keep
+                union = keep | proxy_keep
+                intersection_k = intersection.sum(dim=-1)
+                union_k = union.sum(dim=-1)
+                full_k_float = full_k.float()
+                proxy_k_float = proxy_k.float()
+                intersection_float = intersection_k.float()
+                union_float = union_k.float()
+                ones = torch.ones_like(intersection_float)
+                recall = torch.where(
+                    full_k > 0,
+                    intersection_float / full_k_float.clamp_min(1.0),
+                    ones,
+                )
+                precision = torch.where(
+                    proxy_k > 0,
+                    intersection_float / proxy_k_float.clamp_min(1.0),
+                    ones,
+                )
+                jaccard = torch.where(
+                    union_k > 0,
+                    intersection_float / union_float.clamp_min(1.0),
+                    ones,
+                )
+                score_error = proxy_score.float() - selection_score.float()
+                proxy_kept_full_mass = (
+                    dense_dream * proxy_keep[:, None, None, :]
+                ).sum(dim=-1).mean(dim=(1, 2))
+                mass_ones = torch.ones_like(dense_mass.float())
+                proxy_full_mass_retention = torch.where(
+                    dense_mass.float() > 0,
+                    proxy_kept_full_mass.float() / dense_mass.float().clamp_min(1.0e-12),
+                    mass_ones,
+                )
+                proxy_analysis = {
+                    "proxy_head_dim": proxy_head_dim,
+                    "proxy_channel_indices": channels.detach(),
+                    "full_score": selection_score.detach(),
+                    "proxy_score": proxy_score,
+                    "full_keep_mask": keep.detach(),
+                    "proxy_keep_mask": proxy_keep.detach(),
+                    "full_k": full_k.detach(),
+                    "proxy_k": proxy_k.detach(),
+                    "k_delta": (proxy_k - full_k).detach(),
+                    "teacher_recall": recall.detach(),
+                    "teacher_precision": precision.detach(),
+                    "teacher_jaccard": jaccard.detach(),
+                    "mask_agreement": (keep == proxy_keep).float().mean(dim=-1).detach(),
+                    "false_negative_count": (keep & ~proxy_keep).sum(dim=-1).detach(),
+                    "false_positive_count": (proxy_keep & ~keep).sum(dim=-1).detach(),
+                    "score_mae": score_error.abs().mean(dim=-1).detach(),
+                    "score_rmse": score_error.square().mean(dim=-1).sqrt().detach(),
+                    "full_dense_dream_mass": dense_mass.detach(),
+                    "full_teacher_kept_mass": kept_mass.detach(),
+                    "proxy_mask_kept_full_mass": proxy_kept_full_mass.detach(),
+                    "proxy_full_mass_retention": proxy_full_mass_retention.detach(),
+                }
         return (
             action_out,
             selection_score,
@@ -233,6 +370,7 @@ class ActionDreamThresholdMoT(MoT):
             dense_mass.detach(),
             kept_mass.detach(),
             pruned_mass.detach(),
+            proxy_analysis,
         )
 
     @staticmethod
@@ -247,6 +385,7 @@ class ActionDreamThresholdMoT(MoT):
         dense_mass: torch.Tensor,
         kept_mass: torch.Tensor,
         pruned_mass: torch.Tensor,
+        proxy_analysis: Optional[dict[str, Any]],
         detailed: bool,
     ) -> dict[str, Any]:
         score_float = score.float()
@@ -288,6 +427,102 @@ class ActionDreamThresholdMoT(MoT):
                     "pruned_dream_mass_per_sample": pruned_mass.detach().cpu(),
                 }
             )
+        if proxy_analysis is not None:
+            record.update(
+                {
+                    "proxy_head_dim": int(proxy_analysis["proxy_head_dim"]),
+                    "full_k_mean": float(proxy_analysis["full_k"].float().mean().item()),
+                    "proxy_k_mean": float(proxy_analysis["proxy_k"].float().mean().item()),
+                    "proxy_k_delta_mean": float(
+                        proxy_analysis["k_delta"].float().mean().item()
+                    ),
+                    "proxy_teacher_recall": float(
+                        proxy_analysis["teacher_recall"].float().mean().item()
+                    ),
+                    "proxy_teacher_precision": float(
+                        proxy_analysis["teacher_precision"].float().mean().item()
+                    ),
+                    "proxy_teacher_jaccard": float(
+                        proxy_analysis["teacher_jaccard"].float().mean().item()
+                    ),
+                    "proxy_mask_agreement": float(
+                        proxy_analysis["mask_agreement"].float().mean().item()
+                    ),
+                    "proxy_false_negative_mean": float(
+                        proxy_analysis["false_negative_count"].float().mean().item()
+                    ),
+                    "proxy_false_positive_mean": float(
+                        proxy_analysis["false_positive_count"].float().mean().item()
+                    ),
+                    "proxy_score_mae": float(
+                        proxy_analysis["score_mae"].float().mean().item()
+                    ),
+                    "proxy_score_rmse": float(
+                        proxy_analysis["score_rmse"].float().mean().item()
+                    ),
+                    "full_dense_dream_mass": float(
+                        proxy_analysis["full_dense_dream_mass"].float().mean().item()
+                    ),
+                    "full_teacher_kept_mass": float(
+                        proxy_analysis["full_teacher_kept_mass"].float().mean().item()
+                    ),
+                    "proxy_mask_kept_full_mass": float(
+                        proxy_analysis["proxy_mask_kept_full_mass"].float().mean().item()
+                    ),
+                    "proxy_full_mass_retention": float(
+                        proxy_analysis["proxy_full_mass_retention"].float().mean().item()
+                    ),
+                }
+            )
+            if detailed:
+                record.update(
+                    {
+                        "proxy_channel_indices": proxy_analysis[
+                            "proxy_channel_indices"
+                        ].cpu(),
+                        "full_score": record["score"],
+                        "proxy_score": proxy_analysis["proxy_score"].cpu(),
+                        "full_keep_mask": record["keep_mask"],
+                        "proxy_keep_mask": proxy_analysis["proxy_keep_mask"].cpu(),
+                        "full_k_per_sample": proxy_analysis["full_k"].cpu(),
+                        "proxy_k_per_sample": proxy_analysis["proxy_k"].cpu(),
+                        "proxy_k_delta_per_sample": proxy_analysis["k_delta"].cpu(),
+                        "proxy_teacher_recall_per_sample": proxy_analysis[
+                            "teacher_recall"
+                        ].cpu(),
+                        "proxy_teacher_precision_per_sample": proxy_analysis[
+                            "teacher_precision"
+                        ].cpu(),
+                        "proxy_teacher_jaccard_per_sample": proxy_analysis[
+                            "teacher_jaccard"
+                        ].cpu(),
+                        "proxy_mask_agreement_per_sample": proxy_analysis[
+                            "mask_agreement"
+                        ].cpu(),
+                        "proxy_false_negative_per_sample": proxy_analysis[
+                            "false_negative_count"
+                        ].cpu(),
+                        "proxy_false_positive_per_sample": proxy_analysis[
+                            "false_positive_count"
+                        ].cpu(),
+                        "proxy_score_mae_per_sample": proxy_analysis["score_mae"].cpu(),
+                        "proxy_score_rmse_per_sample": proxy_analysis[
+                            "score_rmse"
+                        ].cpu(),
+                        "full_dense_dream_mass_per_sample": record[
+                            "dense_dream_mass_per_sample"
+                        ],
+                        "full_teacher_kept_mass_per_sample": record[
+                            "kept_dense_dream_mass_per_sample"
+                        ],
+                        "proxy_mask_kept_full_mass_per_sample": proxy_analysis[
+                            "proxy_mask_kept_full_mass"
+                        ].cpu(),
+                        "proxy_full_mass_retention_per_sample": proxy_analysis[
+                            "proxy_full_mass_retention"
+                        ].cpu(),
+                    }
+                )
         return record
 
     def forward(
@@ -344,6 +579,7 @@ class ActionDreamThresholdMoT(MoT):
             return_action_attention
             or return_threshold_statistics
             or cfg.save_detailed_tensors
+            or cfg.proxy_analysis_enabled
             or (cfg.log_statistics and self._collect_training_statistics)
         )
 
@@ -425,7 +661,16 @@ class ActionDreamThresholdMoT(MoT):
                 )
             else:
                 action_result = action_fn(q_cat[:, action_slice], k_cat, v_cat)
-            action_out, score, keep, n_valid, dense_mass, kept_mass, pruned_mass = action_result
+            (
+                action_out,
+                score,
+                keep,
+                n_valid,
+                dense_mass,
+                kept_mass,
+                pruned_mass,
+                proxy_analysis,
+            ) = action_result
             mixed = torch.cat([non_action_out, action_out], dim=1)
 
             if collect_statistics:
@@ -444,6 +689,7 @@ class ActionDreamThresholdMoT(MoT):
                     dense_mass=dense_mass,
                     kept_mass=kept_mass,
                     pruned_mass=pruned_mass,
+                    proxy_analysis=proxy_analysis,
                     detailed=detailed,
                 ))
 
@@ -531,9 +777,19 @@ class ActionDreamThresholdMoT(MoT):
             dream_slice=context_slices["dream"],
             alpha=alpha,
         )
-        action_out, score, keep, n_valid, dense_mass, kept_mass, pruned_mass = action_result
+        (
+            action_out,
+            score,
+            keep,
+            n_valid,
+            dense_mass,
+            kept_mass,
+            pruned_mass,
+            proxy_analysis,
+        ) = action_result
         collect_statistics = bool(
             cfg.save_detailed_tensors
+            or cfg.proxy_analysis_enabled
             or (cfg.log_statistics and self._collect_training_statistics)
         )
         if collect_statistics:
@@ -549,6 +805,7 @@ class ActionDreamThresholdMoT(MoT):
                 dense_mass=dense_mass,
                 kept_mass=kept_mass,
                 pruned_mass=pruned_mass,
+                proxy_analysis=proxy_analysis,
                 detailed=bool(cfg.save_detailed_tensors),
             ))
         return action_out

@@ -10,7 +10,7 @@ train:
     mode: fixed_offset
     future_offset: 4
     future_offsets: [16,32]
-    modalities: ["dyn", "depth", "dino"]
+    modalities: ["dyn", "depth", "dino", "sam"]
     depth:
       source: depth_anything
       root: null

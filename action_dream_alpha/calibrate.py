@@ -246,6 +246,109 @@ def first_step_reuse_metrics(
     return rows
 
 
+def multi_step_reuse_metrics(
+    score: torch.Tensor,
+    dream_token_mass: torch.Tensor,
+    alpha: float,
+    *,
+    diffusion_step_indices: Iterable[int] | None = None,
+    anchor_step_indices: Iterable[int] = (0,),
+) -> list[dict[str, float | int | str]]:
+    """Evaluate a mask refreshed at configured denoising steps.
+
+    At each profiled step, the most recent anchor mask is reused.  As in the
+    single-anchor analysis, all scores and masses come from the dense
+    trajectory, so this is an offline stability diagnostic rather than a
+    causal pruned rollout.
+    """
+    if score.shape != dream_token_mass.shape:
+        raise ValueError(
+            f"score/mass shape mismatch: {tuple(score.shape)} vs "
+            f"{tuple(dream_token_mass.shape)}"
+        )
+    if score.ndim < 3:
+        raise ValueError("reuse analysis expects [sample,time,...,dream_token] tensors.")
+    if diffusion_step_indices is None:
+        steps = list(range(int(score.shape[1])))
+    else:
+        steps = [int(value) for value in diffusion_step_indices]
+    if len(steps) != int(score.shape[1]) or len(set(steps)) != len(steps):
+        raise ValueError("diffusion_step_indices must uniquely match the profile time axis.")
+
+    anchors = sorted({int(value) for value in anchor_step_indices})
+    if not anchors or anchors[0] != steps[0]:
+        raise ValueError("anchor_step_indices must start at the first captured denoising step.")
+    missing_anchors = [value for value in anchors if value not in steps]
+    if missing_anchors:
+        raise ValueError(f"anchor steps {missing_anchors} are absent from captured steps {steps}.")
+
+    score = score.float()
+    mass = dream_token_mass.float()
+    keep_by_step = {step: score[:, position] >= float(alpha) for position, step in enumerate(steps)}
+    schedule_name = "+".join(str(value) for value in anchors)
+
+    def safe_global_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
+        denominator_value = float(denominator.sum().item())
+        if denominator_value == 0.0:
+            return 1.0
+        return float(numerator.sum().item() / denominator_value)
+
+    rows: list[dict[str, float | int | str]] = []
+    current_anchor = anchors[0]
+    for step_position, step_index in enumerate(steps):
+        if step_index in anchors:
+            current_anchor = step_index
+        fixed_keep = keep_by_step[current_anchor]
+        dynamic_keep = keep_by_step[step_index]
+        fixed_k = fixed_keep.sum(dim=-1).float()
+        dynamic_k = dynamic_keep.sum(dim=-1).float()
+        intersection = fixed_keep & dynamic_keep
+        union = fixed_keep | dynamic_keep
+        new_tokens = dynamic_keep & ~fixed_keep
+        intersection_k = intersection.sum(dim=-1).float()
+        union_k = union.sum(dim=-1).float()
+        per_unit_recall = torch.where(
+            dynamic_k > 0,
+            intersection_k / dynamic_k.clamp_min(1.0),
+            torch.ones_like(dynamic_k),
+        )
+        per_unit_jaccard = torch.where(
+            union_k > 0,
+            intersection_k / union_k.clamp_min(1.0),
+            torch.ones_like(union_k),
+        )
+        step_mass = mass[:, step_position]
+        dense_mass = step_mass.sum()
+        fixed_kept_mass = (step_mass * fixed_keep).sum()
+        dynamic_kept_mass = (step_mass * dynamic_keep).sum()
+        rows.append(
+            {
+                "alpha": float(alpha),
+                "anchor_schedule": schedule_name,
+                "active_anchor_diffusion_step_index": int(current_anchor),
+                "diffusion_step_index": int(step_index),
+                "fixed_mean_k": float(fixed_k.mean().item()),
+                "fixed_keep_ratio": float(fixed_keep.float().mean().item()),
+                "dynamic_mean_k": float(dynamic_k.mean().item()),
+                "dynamic_keep_ratio": float(dynamic_keep.float().mean().item()),
+                "mask_jaccard_micro": safe_global_ratio(intersection, union),
+                "later_token_recall_micro": safe_global_ratio(intersection, dynamic_keep),
+                "mean_new_tokens_per_unit": float(new_tokens.sum(dim=-1).float().mean().item()),
+                "per_unit_recall_q10": float(torch.quantile(per_unit_recall.flatten(), 0.1).item()),
+                "per_unit_jaccard_q10": float(torch.quantile(per_unit_jaccard.flatten(), 0.1).item()),
+                "dense_dream_mass": float(dense_mass.item()),
+                "fixed_kept_dense_dream_mass": float(fixed_kept_mass.item()),
+                "fixed_mass_retention": float(
+                    (fixed_kept_mass / dense_mass.clamp_min(1e-12)).item()
+                ),
+                "dynamic_mass_retention": float(
+                    (dynamic_kept_mass / dense_mass.clamp_min(1e-12)).item()
+                ),
+            }
+        )
+    return rows
+
+
 def choose_first_step_reuse_alpha(
     rows: Iterable[dict[str, Any]],
     paired: dict[float, dict[str, float]],
@@ -1217,6 +1320,36 @@ def run_summary(cfg: DictConfig, output_dir: Path) -> None:
         )
         report_alphas = reuse_cfg.get("report_alphas", [0.2, 0.25])
         _save_first_step_reuse_plots(output_dir, reuse_rows, report_alphas)
+
+    multi_reuse_cfg = cfg.get("multi_step_reuse_analysis") or {}
+    if bool(multi_reuse_cfg.get("enabled", False)):
+        schedules = multi_reuse_cfg.get("anchor_step_schedules") or [[step_indices[0]]]
+        multi_reuse_rows = []
+        for schedule in schedules:
+            for alpha in [float(value) for value in cfg.alpha_values]:
+                multi_reuse_rows.extend(
+                    multi_step_reuse_metrics(
+                        score,
+                        token_mass,
+                        alpha,
+                        diffusion_step_indices=step_indices,
+                        anchor_step_indices=schedule,
+                    )
+                )
+        _write_csv(output_dir / "multi_step_reuse.csv", multi_reuse_rows)
+        _atomic_json(
+            output_dir / "multi_step_reuse_scope.json",
+            {
+                "trajectory": "dense_action_denoising",
+                "captured_diffusion_step_indices": step_indices,
+                "anchor_step_schedules": [list(map(int, schedule)) for schedule in schedules],
+                "causal_fixed_mask_rollout_measured": False,
+                "note": (
+                    "Each row reuses the latest anchor mask on the dense trajectory. "
+                    "A real refreshed-mask rollout may change later Action latents and attention."
+                ),
+            },
+        )
 
     per_task = []
     for task, indices in sorted(task_to_indices.items()):

@@ -2,20 +2,24 @@ defaults:
   - dream_fastwam
   - _self_
 
-_target_: fastwam.threshold_runtime.create_threshold_dream_fastwam
+_target_: fastwam.threshold_reuse_runtime.create_threshold_reuse_dream_fastwam
 
 action_dream_threshold:
   enabled: false
   alpha: 1.0
-  warmup_ratio: 0.1
+  warmup_ratio: 0.0
   head_reduce: mean
   action_query_reduce: max
   min_keep_dream_tokens: 0
   detach_selection_score: true
-  log_statistics: true
+  log_statistics: false
   save_detailed_tensors: false
   proxy_analysis_enabled: false
   proxy_head_dim: 16
   proxy_channel_sampling: rope_pair_uniform
+
+# A 10-step Action denoising schedule: select at 0 and refresh at 5.
+action_dream_threshold_reuse:
+  refresh_steps: [0, 5]
 
 finetune_action_only: false

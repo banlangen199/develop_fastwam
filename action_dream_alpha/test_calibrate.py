@@ -10,6 +10,7 @@ from action_dream_alpha.calibrate import (
     choose_first_step_reuse_alpha,
     compute_dense_record,
     first_step_reuse_metrics,
+    multi_step_reuse_metrics,
     resolve_diffusion_step_indices,
     run_summary,
 )
@@ -140,6 +141,26 @@ def test_first_step_reuse_measures_overlap_recall_and_dense_mass() -> None:
     assert final["mean_new_tokens_per_unit"] == 1.0
     assert abs(final["fixed_mass_retention"] - 0.5) < 1e-6
     assert abs(final["dynamic_mass_retention"] - 0.7) < 1e-6
+
+
+def test_multi_step_reuse_refreshes_to_the_latest_anchor() -> None:
+    score = torch.tensor(
+        [[[[0.8, 0.7, 0.1]], [[0.1, 0.8, 0.7]], [[0.1, 0.8, 0.7]]]],
+        dtype=torch.float32,
+    )
+    mass = torch.full_like(score, 1.0)
+    rows = multi_step_reuse_metrics(
+        score,
+        mass,
+        0.5,
+        diffusion_step_indices=[0, 1, 2],
+        anchor_step_indices=[0, 1],
+    )
+    assert rows[0]["active_anchor_diffusion_step_index"] == 0
+    assert rows[1]["active_anchor_diffusion_step_index"] == 1
+    assert rows[2]["active_anchor_diffusion_step_index"] == 1
+    assert rows[2]["later_token_recall_micro"] == 1.0
+    assert abs(rows[2]["fixed_mass_retention"] - 2.0 / 3.0) < 1e-6
 
 
 def test_first_step_selection_uses_recall_mass_and_proxy_loss_constraints() -> None:

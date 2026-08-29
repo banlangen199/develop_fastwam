@@ -19,6 +19,7 @@ os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/fastwam_numba_cache")
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/fastwam_threshold_matplotlib")
 
 import hydra
+import torch
 from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -35,6 +36,10 @@ from experiments.libero.threshold_pruning_stats import (  # noqa: E402
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor  # noqa: E402
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
+from fastwam.models.wan22.action_dream_threshold import (  # noqa: E402
+    ActionDreamThresholdConfig,
+    ThresholdDreamFastWAM,
+)
 from fastwam.utils.pytorch_utils import set_global_seed  # noqa: E402
 
 
@@ -73,6 +78,47 @@ def _write_episode_csv(path: Path, episodes: list[dict]) -> None:
             writer.writerow({field: episode[field] for field in fields})
 
 
+def _write_layer_csv(path: Path, records: list[dict]) -> None:
+    fields = [
+        "episode",
+        "success",
+        "replan",
+        "denoise_step",
+        "layer",
+        "alpha",
+        "total_dream_tokens",
+        "kept_dream_tokens",
+        "pruned_dream_tokens",
+        "prune_ratio",
+        "k_std",
+        "k_min",
+        "k_max",
+        "reuse_inference_step",
+        "mask_refreshed",
+        "proxy_head_dim",
+        "full_k_mean",
+        "proxy_k_mean",
+        "proxy_k_delta_mean",
+        "proxy_teacher_recall",
+        "proxy_teacher_precision",
+        "proxy_teacher_jaccard",
+        "proxy_mask_agreement",
+        "proxy_false_negative_mean",
+        "proxy_false_positive_mean",
+        "proxy_score_mae",
+        "proxy_score_rmse",
+        "full_dense_dream_mass",
+        "full_teacher_kept_mass",
+        "proxy_mask_kept_full_mass",
+        "proxy_full_mass_retention",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for record in records:
+            writer.writerow({field: record.get(field) for field in fields})
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
 def eval_threshold_single_process(cfg: DictConfig):
     start_time = time.time()
@@ -85,6 +131,12 @@ def eval_threshold_single_process(cfg: DictConfig):
     if cfg.ckpt is None:
         raise ValueError("cfg.ckpt must not be None.")
 
+    requested_threshold_config = None
+    if cfg.get("model") is not None and cfg.model.get("action_dream_threshold") is not None:
+        requested_threshold_config = OmegaConf.to_container(
+            cfg.model.action_dream_threshold,
+            resolve=True,
+        )
     training_config_path = base_eval._apply_training_model_config(cfg)
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         raise ValueError(
@@ -99,6 +151,21 @@ def eval_threshold_single_process(cfg: DictConfig):
     model_dtype = base_eval._mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     base_eval._load_model_checkpoint(model, str(cfg.ckpt))
+    if not hasattr(getattr(model, "mot", None), "threshold_config"):
+        if requested_threshold_config is None:
+            raise TypeError(
+                "Evaluation composed neither a threshold-capable model nor an "
+                "action_dream_threshold configuration."
+            )
+        model = ThresholdDreamFastWAM.from_dense_model(
+            model,
+            action_dream_threshold=requested_threshold_config,
+            finetune_action_only=True,
+        )
+    elif requested_threshold_config is not None:
+        model.mot.threshold_config = ActionDreamThresholdConfig.from_dict(
+            requested_threshold_config
+        )
     model = model.to(model_device).eval()
 
     mot = getattr(model, "mot", None)
@@ -108,12 +175,19 @@ def eval_threshold_single_process(cfg: DictConfig):
     collector = ThresholdPruningCollector(
         configured_alpha=float(mot.current_alpha()),
         expected_layers=int(mot.num_layers),
+        capture_proxy_tensors=bool(
+            threshold_cfg.proxy_analysis_enabled
+            and threshold_cfg.save_detailed_tensors
+        ),
     )
     instrument_threshold_model(model, collector)
     print(
         "[threshold-pruning] verified configuration: "
         f"enabled={threshold_cfg.enabled} alpha={mot.current_alpha():.6g} "
-        f"layers={mot.num_layers}"
+        f"layers={mot.num_layers} "
+        f"proxy_analysis={threshold_cfg.proxy_analysis_enabled} "
+        f"proxy_head_dim={threshold_cfg.proxy_head_dim} "
+        f"save_detailed_tensors={threshold_cfg.save_detailed_tensors}"
     )
 
     dataset_stats_path = base_eval._resolve_dataset_stats_path(cfg)
@@ -212,12 +286,25 @@ def eval_threshold_single_process(cfg: DictConfig):
     result_file = output_dir / f"{prefix}_results.json"
     pruning_file = output_dir / f"{prefix}_pruning.json"
     pruning_csv = output_dir / f"{prefix}_pruning_episodes.csv"
+    pruning_layers_csv = output_dir / f"{prefix}_pruning_layers.csv"
+    proxy_tensors_file = output_dir / f"{prefix}_proxy_tensors.pt"
     result_file.write_text(
         json.dumps(results, indent=4, cls=base_eval.NumpyEncoder),
         encoding="utf-8",
     )
     pruning_file.write_text(json.dumps(pruning, indent=4), encoding="utf-8")
     _write_episode_csv(pruning_csv, pruning["episode_summaries"])
+    _write_layer_csv(pruning_layers_csv, collector.layer_records)
+    if collector.proxy_tensor_records:
+        torch_payload = {
+            "task_suite": str(cfg.EVALUATION.task_suite_name),
+            "task_id": int(cfg.EVALUATION.task_id),
+            "gpu_id": int(cfg.gpu_id),
+            "checkpoint": str(cfg.ckpt),
+            "proxy_head_dim": int(threshold_cfg.proxy_head_dim),
+            "records": collector.proxy_tensor_records,
+        }
+        torch.save(torch_payload, proxy_tensors_file)
 
     print(
         "[threshold-pruning] overall "
@@ -229,6 +316,9 @@ def eval_threshold_single_process(cfg: DictConfig):
     )
     print(f"[threshold-pruning] JSON: {pruning_file}")
     print(f"[threshold-pruning] CSV: {pruning_csv}")
+    print(f"[threshold-pruning] layer CSV: {pruning_layers_csv}")
+    if collector.proxy_tensor_records:
+        print(f"[threshold-pruning] proxy tensors: {proxy_tensors_file}")
     print(
         f"Task {cfg.EVALUATION.task_id} completed: "
         f"{results['successes']}/{cfg.EVALUATION.num_trials} successes"
