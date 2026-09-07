@@ -65,6 +65,12 @@ class DreamTargetAdapter:
         self.modality_configs = {name: dict(cfg.get(name, {}) or {}) for name in self.MODALITIES}
         dyn_motion_offset = self.modality_configs.get("dyn", {}).get("motion_offset", None)
         self.dyn_motion_offset = None if dyn_motion_offset is None else int(dyn_motion_offset)
+        self.dyn_motion_threshold_px = float(
+            self.modality_configs.get("dyn", {}).get("motion_threshold_px", 1.0)
+        )
+        self.dyn_score_threshold = float(
+            self.modality_configs.get("dyn", {}).get("score_threshold", 0.5)
+        )
         cameras = cfg.get("cameras", cfg.get("camera", ["image", "wrist_image"]))
         if isinstance(cameras, str):
             cameras = [cameras]
@@ -92,6 +98,16 @@ class DreamTargetAdapter:
                 raise ValueError(f"dream_target.future_offsets must be >= 0, got {self.future_offsets}")
             if self.dyn_motion_offset is not None and self.dyn_motion_offset < 0:
                 raise ValueError(f"dream_target.dyn.motion_offset must be >= 0, got {self.dyn_motion_offset}")
+            if self.dyn_motion_threshold_px < 0:
+                raise ValueError(
+                    "dream_target.dyn.motion_threshold_px must be >= 0, "
+                    f"got {self.dyn_motion_threshold_px}"
+                )
+            if not 0.0 <= self.dyn_score_threshold <= 1.0:
+                raise ValueError(
+                    "dream_target.dyn.score_threshold must be in [0, 1], "
+                    f"got {self.dyn_score_threshold}"
+                )
             unknown = set(self.modalities) - self.MODALITIES
             if unknown:
                 raise ValueError(f"Unsupported dream_target.modalities: {sorted(unknown)}")
@@ -278,12 +294,10 @@ class DreamTargetAdapter:
                     start_row = self._frame_row_from_path(path, frame_index)
                     target_row = self._frame_row_from_path(path, target_frame)
                     delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
-                    motion = delta.norm(dim=-1, keepdim=True)
                     visibility = self._load_extra_array(path, "visibility", required=False)
                     if visibility is not None:
-                        motion = motion * torch.as_tensor(visibility[target_row]).float().reshape(-1, 1)
-                    motion = (motion / motion.max().clamp(min=1e-6)).clamp(0.0, 1.0)
-                    per_cam.append((motion, str(path)))
+                        delta = delta * torch.as_tensor(visibility[target_row]).float().reshape(-1, 1)
+                    per_cam.append((delta, str(path)))
             else:
                 per_cam = [
                     (
@@ -299,12 +313,16 @@ class DreamTargetAdapter:
             final = self._concat_camera_targets(per_cam[0][0], per_cam[1][0], modality)
             if modality == "depth":
                 concat_shape = list(self.concat_2cam_images_horiz(per_cam[0][0], per_cam[1][0], modality).shape)
-                layout = "token_feature"
+                layout = "image"
             elif modality == "dyn":
-                concat_shape = list(torch.cat(
-                    [self._dynamic_score_to_grid(per_cam[0][0]), self._dynamic_score_to_grid(per_cam[1][0])],
-                    dim=1,
-                ).shape)
+                if per_cam[0][0].ndim == 2 and per_cam[0][0].shape[-1] == 2:
+                    grid_h, grid_w = self._infer_token_grid("dyn", per_cam[0][0].shape[0])
+                    concat_shape = [grid_h, grid_w * 2, 2]
+                else:
+                    concat_shape = list(torch.cat(
+                        [self._dynamic_score_to_grid(per_cam[0][0]), self._dynamic_score_to_grid(per_cam[1][0])],
+                        dim=1,
+                    ).shape)
                 layout = "token_feature"
             elif modality in {"dino", "sam"}:
                 layout = self.modality_configs.get(modality, {}).get("target_layout", "grid_feature")
@@ -453,14 +471,11 @@ class DreamTargetAdapter:
                 if tracks.ndim != 3 or tracks.shape[-1] != 2:
                     raise ValueError(f"{path} key 'tracks' must have shape [T, N, 2], got {tracks.shape}.")
                 delta = torch.as_tensor(tracks[target_row]).float() - torch.as_tensor(tracks[start_row]).float()
-                motion = delta.norm(dim=-1, keepdim=True)
                 visibility = self._load_extra_array(path, "visibility", required=False)
                 if visibility is not None:
                     vis = torch.as_tensor(visibility[target_row]).float().reshape(-1, 1)
-                    motion = motion * vis
-                max_motion = motion.max().clamp(min=1e-6)
-                motion = (motion / max_motion).clamp(0.0, 1.0)
-                dyn_tensors.append(motion)
+                    delta = delta * vis
+                dyn_tensors.append(delta)
             elif self._extra_has_key(path, "dyn"):
                 arr = self._load_extra_array(path, "dyn")
                 if arr.ndim < 2 or target_frame >= arr.shape[1]:
@@ -507,15 +522,12 @@ class DreamTargetAdapter:
 
     def _concat_camera_targets(self, primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:
         if modality == "depth":
-            image = self.concat_2cam_images_horiz(primary, wrist, modality)
-            patch_size = int(self.modality_configs.get("depth", {}).get("patch_size", self.image_patch_size))
-            return self._patchify_image_target(image, patch_size=patch_size, modality=modality)
+            return self.concat_2cam_images_horiz(primary, wrist, modality)
         if modality == "dyn":
-            primary_mask = self._dynamic_score_to_grid(primary)
-            wrist_mask = self._dynamic_score_to_grid(wrist)
-            dyn_map = torch.cat([primary_mask, wrist_mask], dim=1).contiguous()
             patch_size = int(self.modality_configs.get("dyn", {}).get("patch_size", self.image_patch_size))
-            return self._patch_pool_dynamic_score(dyn_map, patch_size=patch_size)
+            primary_mask = self._dynamic_to_patch_mask(primary, patch_size=patch_size)
+            wrist_mask = self._dynamic_to_patch_mask(wrist, patch_size=patch_size)
+            return torch.cat([primary_mask, wrist_mask], dim=0).contiguous()
         if modality in {"dino", "sam"}:
             primary_tokens = self._as_token_matrix(primary, modality)
             wrist_tokens = self._as_token_matrix(wrist, modality)
@@ -523,43 +535,39 @@ class DreamTargetAdapter:
             return self.concat_2cam_tokens_horiz(primary_tokens, wrist_tokens, grid_h, grid_w)
         raise ValueError(f"Unsupported dream modality={modality!r}")
 
-    @staticmethod
-    def _patchify_image_target(image: torch.Tensor, patch_size: int, modality: str) -> torch.Tensor:
-        if patch_size <= 0:
-            raise ValueError(f"{modality}.patch_size must be positive, got {patch_size}.")
-        image = image.float()
-        if image.ndim == 2:
-            image = image.unsqueeze(0)
-        elif image.ndim == 3 and image.shape[0] >= 1:
-            pass
-        else:
-            raise ValueError(f"{modality} image target must be [H,W] or [C,H,W], got {tuple(image.shape)}.")
-        c, h, w = image.shape
-        if h % patch_size != 0 or w % patch_size != 0:
-            raise ValueError(
-                f"{modality} image target H/W must be divisible by patch_size={patch_size}, got C,H,W={tuple(image.shape)}."
-            )
-        patches = F.unfold(image.unsqueeze(0), kernel_size=patch_size, stride=patch_size)
-        return patches.squeeze(0).transpose(0, 1).contiguous()
-
-    @staticmethod
-    def _patch_pool_dynamic_score(score_map: torch.Tensor, patch_size: int) -> torch.Tensor:
+    def _dynamic_to_patch_mask(self, dynamic: torch.Tensor, patch_size: int) -> torch.Tensor:
         if patch_size <= 0:
             raise ValueError(f"dyn.patch_size must be positive, got {patch_size}.")
-        score_map = score_map.float().clamp(0.0, 1.0)
-        if score_map.ndim != 2:
-            raise ValueError(f"dyn score map must be [H,W] before patch pooling, got {tuple(score_map.shape)}.")
-        h, w = score_map.shape
-        if h % patch_size != 0 or w % patch_size != 0:
-            raise ValueError(
-                f"dyn score map H/W must be divisible by patch_size={patch_size}, got H,W={tuple(score_map.shape)}."
-            )
-        pooled = F.avg_pool2d(
-            score_map.unsqueeze(0).unsqueeze(0),
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
-        return pooled.flatten(2).transpose(1, 2).squeeze(0).contiguous()
+
+        dynamic = dynamic.float()
+        if dynamic.ndim == 2 and dynamic.shape[-1] == 2:
+            grid_h, grid_w = self._infer_token_grid("dyn", dynamic.shape[0])
+            vector_map = dynamic.reshape(grid_h, grid_w, 2).permute(2, 0, 1).unsqueeze(0)
+            h, w = grid_h, grid_w
+            if h % patch_size != 0 or w % patch_size != 0:
+                raise ValueError(
+                    f"dyn motion grid H/W must be divisible by patch_size={patch_size}, "
+                    f"got H,W={(h, w)}."
+                )
+            pooled_vector = F.avg_pool2d(vector_map, kernel_size=patch_size, stride=patch_size)
+            strength = pooled_vector.norm(dim=1)
+            mask = strength > self.dyn_motion_threshold_px
+        else:
+            score_map = self._dynamic_score_to_grid(dynamic)
+            h, w = score_map.shape
+            if h % patch_size != 0 or w % patch_size != 0:
+                raise ValueError(
+                    f"dyn score map H/W must be divisible by patch_size={patch_size}, "
+                    f"got H,W={(h, w)}."
+                )
+            pooled_score = F.avg_pool2d(
+                score_map.unsqueeze(0).unsqueeze(0),
+                kernel_size=patch_size,
+                stride=patch_size,
+            ).squeeze(1)
+            mask = pooled_score > self.dyn_score_threshold
+
+        return mask.reshape(-1, 1).to(dtype=torch.float32).contiguous()
 
     @staticmethod
     def concat_2cam_images_horiz(primary: torch.Tensor, wrist: torch.Tensor, modality: str) -> torch.Tensor:

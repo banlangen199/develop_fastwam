@@ -57,7 +57,7 @@ class _FakeDreamInference:
         self.prefill_return_dream_calls.append(bool(return_dream))
         dream_predictions = None
         if return_dream:
-            dream_predictions = {"depth": torch.ones((1, 2, 8, 4))}
+            dream_predictions = {"depth": torch.ones((1, 2, 4, 8))}
         return {"dream_predictions": dream_predictions}
 
     def _predict_action_noise_with_cache(self, *, latents_action, **_):
@@ -79,7 +79,7 @@ def test_infer_action_decodes_dream_only_once():
     assert fake.cached_action_calls == 3
     assert output["future_offsets"] == [16, 32]
     assert output["camera_token_split"] == [9, 9]
-    assert output["dream_predictions"]["depth"].shape == (2, 8, 4)
+    assert output["dream_predictions"]["depth"].shape == (2, 4, 8)
 
 
 def test_default_infer_action_does_not_run_dream_decoder():
@@ -97,7 +97,7 @@ def test_default_infer_action_does_not_run_dream_decoder():
 
 
 def test_split_prediction_views_restores_camera_geometry():
-    depth = np.arange(8 * 4, dtype=np.float32).reshape(8, 4)
+    depth = np.arange(4 * 8, dtype=np.float32).reshape(4, 8)
     depth_views = split_prediction_views("depth", depth)
     assert depth_views["image"].shape == (4, 4)
     assert depth_views["wrist_image"].shape == (4, 4)
@@ -123,7 +123,7 @@ def _record():
         },
         "future_offsets": [16, 32],
         "dream_predictions": {
-            "depth": torch.rand((2, 8, 4), generator=generator),
+            "depth": torch.rand((2, 4, 8), generator=generator),
             "dyn": torch.randn((2, 8, 1), generator=generator),
             "dino": torch.randn((2, 2, 4, 6), generator=generator),
             "sam": torch.randn((2, 2, 4, 4), generator=generator),

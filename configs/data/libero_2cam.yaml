@@ -61,7 +61,7 @@ train:
       sam: [16, 16]
     target_shapes:
       dyn: [392, 1]
-      depth: [512, 64]
+      depth: [128, 256]
       dino: [16, 32, 768]
       sam: [16, 32, 256]
     dyn:
@@ -69,11 +69,14 @@ train:
       target_layout: token_feature
       source_layout: image
       patch_size: 2
+      motion_threshold_px: 1.0
+      score_threshold: 0.5
     depth:
       source: depth_anything
       root: ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot/extras/depth_anything_v3_metric
       model: depth_anything_v3
-      patch_size: 8
+      target_layout: image
+      patch_size: 4
     dino:
       target_layout: grid_feature
     sam:

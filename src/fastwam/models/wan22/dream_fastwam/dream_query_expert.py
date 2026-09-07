@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..wan_video_dit import DiTBlock, precompute_freqs_cis
 from fastwam.utils.logging_config import get_logger
@@ -26,6 +27,7 @@ class DenseDreamDecoder(nn.Module):
         latent_dim: int,
         target_shape: list[int] | tuple[int, ...],
         target_layout: str = "token_feature",
+        patch_size: int | None = None,
         decoder_dim: int,
         decoder_ffn_dim: int,
         num_layers: int,
@@ -39,6 +41,7 @@ class DenseDreamDecoder(nn.Module):
         self.enabled = bool(enabled)
         self.type = type
         self.target_layout = str(target_layout)
+        self.patch_size = None if patch_size is None else int(patch_size)
         self.decoder_dim = int(decoder_dim)
         self.decoder_ffn_dim = int(decoder_ffn_dim)
         self.num_layers = int(num_layers)
@@ -87,14 +90,30 @@ class DenseDreamDecoder(nn.Module):
             self.feature_dim = int(self.target_shape[-1])
             self.output_grid_shape = self.target_shape[:-1]
         elif self.target_layout == "image":
-            raise ValueError(
-                f"dream_decoder.{modality}.target_layout=image is not supported in the first version. "
-                "Patchify image-like targets in the dataset and use token_feature."
-            )
+            if len(self.target_shape) != 2:
+                raise ValueError(
+                    f"dream_decoder.{modality}.target_layout=image requires "
+                    f"target_shape=[height, width], got {target_shape}."
+                )
+            if self.patch_size is None or self.patch_size <= 0:
+                raise ValueError(
+                    f"dream_decoder.{modality}.target_layout=image requires patch_size > 0, "
+                    f"got {patch_size}."
+                )
+            height, width = self.target_shape
+            if height % self.patch_size != 0 or width % self.patch_size != 0:
+                raise ValueError(
+                    f"dream_decoder.{modality} image shape {self.target_shape} must be divisible "
+                    f"by patch_size={self.patch_size}."
+                )
+            grid_h, grid_w = height // self.patch_size, width // self.patch_size
+            self.num_output_tokens = grid_h * grid_w
+            self.feature_dim = self.patch_size**2
+            self.output_grid_shape = (grid_h, grid_w)
         else:
             raise ValueError(
                 f"Unsupported dream_decoder.{modality}.target_layout={self.target_layout!r}; "
-                "expected token_feature or grid_feature."
+                "expected token_feature, grid_feature, or image."
             )
 
         self.latent_proj = nn.Linear(int(latent_dim), self.decoder_dim)
@@ -126,11 +145,35 @@ class DenseDreamDecoder(nn.Module):
         out = self.output_proj(decoded)
         if self.target_layout == "grid_feature":
             return out.reshape(latent_tokens.shape[0], *self.target_shape)
+        if self.target_layout == "image":
+            return self._unpatchify_image(out)
         return out
+
+    def _unpatchify_image(self, patches: torch.Tensor) -> torch.Tensor:
+        if self.target_layout != "image":
+            raise RuntimeError(f"{self.modality} decoder is not configured for image output.")
+        if patches.ndim != 3 or tuple(patches.shape[1:]) != (
+            self.num_output_tokens,
+            self.feature_dim,
+        ):
+            raise ValueError(
+                f"{self.modality} image patches must be [B,{self.num_output_tokens},{self.feature_dim}], "
+                f"got {tuple(patches.shape)}."
+            )
+        grid_h, grid_w = self.output_grid_shape
+        patch = self.patch_size
+        image = (
+            patches.reshape(patches.shape[0], grid_h, grid_w, patch, patch)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(patches.shape[0], *self.target_shape)
+        )
+        if self.modality == "depth":
+            image = F.relu(image)
+        return image.contiguous()
 
     def _two_view_query_indices(self, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Return output-query indices for the left (primary) and right (wrist) views."""
-        if self.target_layout == "grid_feature":
+        if self.target_layout in {"grid_feature", "image"}:
             grid_h, combined_grid_w = self.output_grid_shape
             if combined_grid_w % 2 != 0:
                 raise ValueError(
@@ -212,6 +255,22 @@ class DenseDreamDecoder(nn.Module):
                 wrist_out.shape[0], grid_h, per_view_grid_w, self.feature_dim
             )
             return torch.cat([primary_out, wrist_out], dim=2)
+
+        if self.target_layout == "image":
+            grid_h, combined_grid_w = self.output_grid_shape
+            per_view_grid_w = combined_grid_w // 2
+            combined_patches = torch.cat(
+                [
+                    primary_out.reshape(
+                        primary_out.shape[0], grid_h, per_view_grid_w, self.feature_dim
+                    ),
+                    wrist_out.reshape(
+                        wrist_out.shape[0], grid_h, per_view_grid_w, self.feature_dim
+                    ),
+                ],
+                dim=2,
+            ).reshape(primary_out.shape[0], self.num_output_tokens, self.feature_dim)
+            return self._unpatchify_image(combined_patches)
 
         per_view_tokens = self.num_output_tokens // 2
         grid_h = int(round(per_view_tokens**0.5))
@@ -430,6 +489,7 @@ class DreamQueryExpert(nn.Module):
                 latent_dim=self.hidden_dim,
                 target_shape=cfg.get("target_shape"),
                 target_layout=cfg.get("target_layout", "token_feature"),
+                patch_size=cfg.get("patch_size"),
                 decoder_dim=decoder_dim,
                 decoder_ffn_dim=decoder_ffn_dim,
                 num_layers=decoder_layers,
@@ -487,6 +547,7 @@ class DreamQueryExpert(nn.Module):
                         "enabled": bool(decoder.enabled),
                         "target_layout": getattr(decoder, "target_layout", None),
                         "target_shape": list(decoder.target_shape) if getattr(decoder, "target_shape", None) is not None else None,
+                        "patch_size": getattr(decoder, "patch_size", None),
                     }
                     for name, decoder in self.decoders.items()
                 },

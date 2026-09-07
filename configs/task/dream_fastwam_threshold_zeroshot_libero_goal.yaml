@@ -17,8 +17,9 @@ model:
   dream_query_config:
     dream_decoder:
       depth:
-        patch_size: 2
-        target_shape: [8192, 4]
+        target_layout: image
+        patch_size: 4
+        target_shape: [128, 256]
   action_dream_threshold:
     enabled: true
     alpha: 1.0
@@ -29,4 +30,3 @@ model:
     detach_selection_score: true
     log_statistics: true
     save_detailed_tensors: false
-

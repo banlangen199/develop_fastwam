@@ -26,9 +26,10 @@ data:
     pretrained_norm_stats: runs/dream_fastwam_libero/2026-08-23_10-02-36_14476/dataset_stats.json
     dream_target:
       target_shapes:
-        depth: [8192, 4]
+        depth: [128, 256]
       depth:
-        patch_size: 2
+        target_layout: image
+        patch_size: 4
 
 model:
   finetune_action_only: true
@@ -36,8 +37,9 @@ model:
   dream_query_config:
     dream_decoder:
       depth:
-        patch_size: 2
-        target_shape: [8192, 4]
+        target_layout: image
+        patch_size: 4
+        target_shape: [128, 256]
   action_dream_threshold:
     enabled: true
     alpha: 0.2

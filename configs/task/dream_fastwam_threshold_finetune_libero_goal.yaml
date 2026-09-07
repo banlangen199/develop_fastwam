@@ -31,8 +31,9 @@ model:
   dream_query_config:
     dream_decoder:
       depth:
-        patch_size: 2
-        target_shape: [8192, 4]
+        target_layout: image
+        patch_size: 4
+        target_shape: [128, 256]
   action_dream_threshold:
     enabled: true
     alpha: 1.0
@@ -47,4 +48,3 @@ model:
     lambda_video: 0.0
     lambda_action: 1.0
     lambda_dream: 0.0
-

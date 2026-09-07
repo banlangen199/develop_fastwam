@@ -127,7 +127,7 @@ def load_record_depths(
     future_offset: int | None,
     horizon_index: int | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], int, int]:
-    """Load and unpatchify both predicted depth views from a Dream record."""
+    """Load both predicted depth-map views from a Dream record."""
     import torch
 
     resolved = record_path.expanduser().resolve()
@@ -144,7 +144,7 @@ def load_record_depths(
     offsets = [int(value) for value in record.get("future_offsets", [])]
     if depth_predictions.ndim != 3:
         raise ValueError(
-            "dream_predictions['depth'] must be [num_horizons,2N,P], "
+            "dream_predictions['depth'] must be [num_horizons,H,2W] or legacy [num_horizons,2N,P], "
             f"got {depth_predictions.shape}."
         )
     if len(offsets) != depth_predictions.shape[0]:
@@ -167,13 +167,17 @@ def load_record_depths(
             )
     selected_offset = offsets[selected_index]
 
-    primary_grid, wrist_grid = _split_flat_square_views(
-        np.asarray(depth_predictions[selected_index], dtype=np.float32)
-    )
-    depths = {
-        "image": _unpatchify_depth(primary_grid),
-        "wrist_image": _unpatchify_depth(wrist_grid),
-    }
+    selected = np.asarray(depth_predictions[selected_index], dtype=np.float32)
+    if selected.ndim == 2 and selected.shape[1] == 2 * selected.shape[0]:
+        half = selected.shape[1] // 2
+        depths = {"image": selected[:, :half], "wrist_image": selected[:, half:]}
+    else:
+        # Keep old saved [2N,P] prediction records readable.
+        primary_grid, wrist_grid = _split_flat_square_views(selected)
+        depths = {
+            "image": _unpatchify_depth(primary_grid),
+            "wrist_image": _unpatchify_depth(wrist_grid),
+        }
     return depths, record, selected_index, selected_offset
 
 

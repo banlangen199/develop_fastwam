@@ -710,7 +710,49 @@ class Wan22Trainer:
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
+        profile_steps_raw = os.environ.get("FASTWAM_PROFILE_TRAIN_STEPS", "0")
+        profile_warmup_steps_raw = os.environ.get("FASTWAM_PROFILE_WARMUP_STEPS", "0")
+        try:
+            profile_steps = max(int(profile_steps_raw), 0)
+            profile_warmup_steps = max(int(profile_warmup_steps_raw), 0)
+        except ValueError as exc:
+            raise ValueError(
+                "FASTWAM_PROFILE_TRAIN_STEPS and FASTWAM_PROFILE_WARMUP_STEPS "
+                "must be non-negative integers, got "
+                f"{profile_steps_raw!r} and {profile_warmup_steps_raw!r}."
+            ) from exc
+        profile_times = {
+            "data": 0.0,
+            "forward": 0.0,
+            "backward": 0.0,
+            "optimizer": 0.0,
+            "metrics": 0.0,
+        }
+        profile_micro_steps = 0
+        profile_reported = False
+
+        def profile_sync():
+            if self.accelerator.device.type == "cuda":
+                torch.cuda.synchronize(self.accelerator.device)
+
+        if profile_steps > 0:
+            logger.info(
+                "Training stage profiler enabled for %d optimizer steps after %d warmup steps; "
+                "CUDA synchronization will make its reported throughput diagnostic-only.",
+                profile_steps,
+                profile_warmup_steps,
+            )
+
         while self.global_step < self.max_steps:
+            run_steps = self.global_step - self.run_start_step
+            profiling = (
+                profile_steps > 0
+                and profile_warmup_steps <= run_steps
+                and run_steps < profile_warmup_steps + profile_steps
+            )
+            if profiling:
+                profile_sync()
+                stage_start = time.perf_counter()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -720,21 +762,43 @@ class Wan22Trainer:
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
                 continue
+            if profiling:
+                profile_times["data"] += time.perf_counter() - stage_start
+                profile_micro_steps += 1
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
+                if profiling:
+                    profile_sync()
+                    stage_start = time.perf_counter()
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
+                if profiling:
+                    profile_sync()
+                    profile_times["forward"] += time.perf_counter() - stage_start
+
+                    stage_start = time.perf_counter()
                 self.accelerator.backward(loss)
+                if profiling:
+                    profile_sync()
+                    profile_times["backward"] += time.perf_counter() - stage_start
 
                 if self.accelerator.sync_gradients:
+                    if profiling:
+                        stage_start = time.perf_counter()
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    if profiling:
+                        profile_sync()
+                        profile_times["optimizer"] += time.perf_counter() - stage_start
+
                     self.global_step += 1
+                    if profiling:
+                        stage_start = time.perf_counter()
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
                     )
@@ -746,6 +810,39 @@ class Wan22Trainer:
                         )
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    if profiling:
+                        profile_sync()
+                        profile_times["metrics"] += time.perf_counter() - stage_start
+
+                    completed_profile_steps = (
+                        self.global_step - self.run_start_step - profile_warmup_steps
+                    )
+                    if (
+                        profiling
+                        and not profile_reported
+                        and completed_profile_steps >= profile_steps
+                    ):
+                        measured_total = sum(profile_times.values())
+                        logger.info(
+                            "[train-profile] optimizer_steps=%d micro_steps=%d "
+                            "data=%.3fs (%.1f%%) forward=%.3fs (%.1f%%) "
+                            "backward=%.3fs (%.1f%%) optimizer=%.3fs (%.1f%%) "
+                            "metrics=%.3fs (%.1f%%) measured_total=%.3fs",
+                            completed_profile_steps,
+                            profile_micro_steps,
+                            profile_times["data"],
+                            100.0 * profile_times["data"] / max(measured_total, 1e-9),
+                            profile_times["forward"],
+                            100.0 * profile_times["forward"] / max(measured_total, 1e-9),
+                            profile_times["backward"],
+                            100.0 * profile_times["backward"] / max(measured_total, 1e-9),
+                            profile_times["optimizer"],
+                            100.0 * profile_times["optimizer"] / max(measured_total, 1e-9),
+                            profile_times["metrics"],
+                            100.0 * profile_times["metrics"] / max(measured_total, 1e-9),
+                            measured_total,
+                        )
+                        profile_reported = True
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 

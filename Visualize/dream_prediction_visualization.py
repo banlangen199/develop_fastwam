@@ -88,9 +88,15 @@ def split_prediction_views(
     if modality in {"dino", "sam"}:
         primary, wrist = _split_dense_grid(array)
     elif modality == "depth":
-        primary_grid, wrist_grid = _split_flat_square_views(array)
-        primary = _unpatchify_depth(primary_grid)
-        wrist = _unpatchify_depth(wrist_grid)
+        if array.ndim == 2 and array.shape[1] == 2 * array.shape[0]:
+            half = array.shape[1] // 2
+            primary, wrist = array[:, :half], array[:, half:]
+        else:
+            # Backward compatibility for prediction records produced before
+            # depth decoders returned full maps.
+            primary_grid, wrist_grid = _split_flat_square_views(array)
+            primary = _unpatchify_depth(primary_grid)
+            wrist = _unpatchify_depth(wrist_grid)
     elif modality == "dyn":
         primary_grid, wrist_grid = _split_flat_square_views(array)
         primary = primary_grid.squeeze(-1)

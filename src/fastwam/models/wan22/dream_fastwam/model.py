@@ -506,23 +506,25 @@ class DreamFastWAM(FastWAM):
         per_horizon_terms = []
         loss_terms = []
         if "dyn" in targets:
-            dyn_min = float(targets["dyn"].detach().amin().item())
-            dyn_max = float(targets["dyn"].detach().amax().item())
-            if dyn_min < -1e-4 or dyn_max > 1.0 + 1e-4:
-                logger.warning(
-                    "Dream dyn target should be in [0, 1], got min=%.6f max=%.6f",
-                    dyn_min,
-                    dyn_max,
+            dyn_target = targets["dyn"].float()
+            is_binary = torch.logical_or(dyn_target == 0.0, dyn_target == 1.0)
+            if not bool(is_binary.all().item()):
+                invalid = dyn_target[~is_binary]
+                raise ValueError(
+                    "Dream dyn target must contain only binary 0/1 labels, got "
+                    f"min={float(invalid.amin().item()):.6f} "
+                    f"max={float(invalid.amax().item()):.6f}."
                 )
             loss_dyn_each = reduce_except_batch_horizon(
-                F.binary_cross_entropy_with_logits(pred["dyn"].float(), targets["dyn"].float(), reduction="none")
+                F.binary_cross_entropy_with_logits(pred["dyn"].float(), dyn_target, reduction="none")
             )
             loss_dyn = masked_mean(loss_dyn_each, "dyn")
             per_horizon_terms.append((self.loss_lambda_dyn * loss_dyn_each, valid_by_modality["dyn"]))
             loss_terms.append(self.loss_lambda_dyn * loss_dyn)
         if "depth" in targets:
-            loss_depth_each = reduce_except_batch_horizon(
-                F.smooth_l1_loss(pred["depth"].float(), targets["depth"].float(), reduction="none")
+            loss_depth_each = self._silog_depth_loss_each(
+                pred["depth"],
+                targets["depth"],
             )
             loss_depth = masked_mean(loss_depth_each, "depth")
             per_horizon_terms.append((self.loss_lambda_depth * loss_depth_each, valid_by_modality["depth"]))
@@ -576,6 +578,54 @@ class DreamFastWAM(FastWAM):
             parts[f"future_valid_count_{offset}"] = horizon_valid.sum()
             parts[f"loss_future_{offset}"] = (loss_future_each[:, horizon_idx] * horizon_valid).sum() / horizon_den
         return loss_dream, parts
+
+    @staticmethod
+    def _silog_depth_loss_each(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        lambd: float = 0.5,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """DreamVLA SILog, independently reduced per horizon and camera view."""
+        if pred.ndim != 4 or target.ndim != 4:
+            raise ValueError(
+                "Dream depth maps must be [B,O,H,2W], got "
+                f"pred={tuple(pred.shape)} target={tuple(target.shape)}."
+            )
+        if tuple(pred.shape) != tuple(target.shape):
+            raise ValueError(
+                f"Dream depth prediction/target shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}."
+            )
+        if pred.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"Dream depth map width must contain two equal camera views, got {pred.shape[-1]}."
+            )
+
+        # Depth Anything targets are precomputed metric-depth maps and are
+        # finite and strictly positive. Keep the hot path identical to
+        # DreamVLA's SiLog formula instead of building an additional full-map
+        # validity-mask graph. Splitting returns views, so it also avoids
+        # copying both camera maps into a new stacked tensor.
+        view_losses = []
+        for pred_view, target_view in zip(
+            pred.chunk(2, dim=-1),
+            target.chunk(2, dim=-1),
+        ):
+            diff_log = torch.log(target_view + eps) - torch.log(pred_view + eps)
+            mean = diff_log.mean(dim=(-2, -1))
+            mean_square = diff_log.square().mean(dim=(-2, -1))
+            radicand = (mean_square - float(lambd) * mean.square()).clamp_min(0.0)
+
+            # DreamVLA uses sqrt(radicand). A tiny offset prevents an infinite
+            # derivative at an exact match without changing nonzero losses in
+            # practice.
+            sqrt_eps = 1e-12
+            view_losses.append(
+                (torch.sqrt(radicand + sqrt_eps) - sqrt_eps**0.5).clamp_min(0.0)
+            )
+
+        return torch.stack(view_losses, dim=-1).mean(dim=-1)
 
     @staticmethod
     def _flatten_feature_target(tensor: torch.Tensor, name: str) -> torch.Tensor:

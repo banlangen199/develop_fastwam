@@ -86,10 +86,10 @@ dream_query_config:
     image_patch_size: 16
     depth:
       enabled: true
-      target_layout: token_feature
+      target_layout: image
       source_layout: image
-      patch_size: 8
-      target_shape: [512, 64]
+      patch_size: 4
+      target_shape: [128, 256]
     dino:
       enabled: true
       target_layout: grid_feature
@@ -129,6 +129,6 @@ loss:
   lambda_video: 1.0
   lambda_dream: 0.1
   lambda_dyn: 1.0
-  lambda_depth: 10.0
+  lambda_depth: 1.0
   lambda_dino: 1.0
   lambda_sam: 1.0

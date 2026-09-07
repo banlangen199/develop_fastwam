@@ -3,12 +3,13 @@ import torch
 from fastwam.models.wan22.dream_fastwam import DenseDreamDecoder, DreamQueryExpert
 
 
-def _decoder(target_shape, target_layout):
+def _decoder(target_shape, target_layout, patch_size=None):
     decoder = DenseDreamDecoder(
         modality="test",
         latent_dim=8,
         target_shape=target_shape,
         target_layout=target_layout,
+        patch_size=patch_size,
         decoder_dim=8,
         decoder_ffn_dim=16,
         num_layers=1,
@@ -46,15 +47,48 @@ def test_two_view_token_decoder_restores_horizontal_patch_order():
     assert not torch.allclose(base[:, :, 2:], changed_wrist[:, :, 2:])
 
 
+def test_two_view_image_decoder_restores_dense_map_and_isolates_cameras():
+    torch.manual_seed(2)
+    decoder = _decoder((4, 8), "image", patch_size=2)
+    primary = torch.randn(1, 2, 8)
+    wrist = torch.randn(1, 2, 8)
+
+    base = decoder.forward_two_view(primary, wrist)
+    changed_wrist = decoder.forward_two_view(primary, wrist + 10.0)
+
+    assert base.shape == (1, 4, 8)
+    torch.testing.assert_close(base[:, :, :4], changed_wrist[:, :, :4])
+    assert not torch.allclose(base[:, :, 4:], changed_wrist[:, :, 4:])
+
+
+def test_depth_image_layout_keeps_legacy_decoder_parameter_shapes() -> None:
+    legacy = _decoder((512, 64), "token_feature")
+    image = _decoder((128, 256), "image", patch_size=8)
+
+    legacy_state = legacy.state_dict()
+    image_state = image.state_dict()
+    assert legacy_state.keys() == image_state.keys()
+    assert {
+        key: tuple(value.shape) for key, value in legacy_state.items()
+    } == {
+        key: tuple(value.shape) for key, value in image_state.items()
+    }
+    image.load_state_dict(legacy_state, strict=True)
+
+
 def test_configured_modality_shapes_split_into_equal_camera_regions():
     specs = [
-        ((512, 64), "token_feature", 256),
+        ((128, 256), "image", 256),
         ((392, 1), "token_feature", 196),
         ((16, 32, 768), "grid_feature", 256),
         ((16, 32, 256), "grid_feature", 256),
     ]
     for target_shape, target_layout, expected_per_view in specs:
-        decoder = _decoder(target_shape, target_layout)
+        decoder = _decoder(
+            target_shape,
+            target_layout,
+            patch_size=8 if target_layout == "image" else None,
+        )
         primary_indices, wrist_indices = decoder._two_view_query_indices(device=torch.device("cpu"))
         assert primary_indices.numel() == expected_per_view
         assert wrist_indices.numel() == expected_per_view

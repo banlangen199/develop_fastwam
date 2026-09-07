@@ -11,7 +11,12 @@ def _adapter() -> DreamTargetAdapter:
         cfg={
             "enabled": False,
             "feature_dims": {"sam": 4, "dino": 3},
-            "token_grids": {"sam": [2, 3], "dino": [2, 2]},
+            "token_grids": {"sam": [2, 3], "dino": [2, 2], "dyn": [4, 4]},
+            "dyn": {
+                "patch_size": 2,
+                "motion_threshold_px": 1.0,
+                "score_threshold": 0.5,
+            },
         },
     )
 
@@ -46,22 +51,37 @@ def test_existing_token_matrix_layout_is_unchanged() -> None:
     torch.testing.assert_close(actual, tokens)
 
 
-def test_depth_patch_size_eight_preserves_two_view_depth_pixels() -> None:
+def test_depth_target_is_a_two_view_dense_map() -> None:
     primary = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     wrist = primary + primary.numel()
-    combined = torch.cat([primary, wrist], dim=1)
+    actual = _adapter()._concat_camera_targets(primary, wrist, "depth")
 
-    patches = DreamTargetAdapter._patchify_image_target(
-        combined,
-        patch_size=8,
-        modality="depth",
-    )
+    assert actual.shape == (128, 256)
+    torch.testing.assert_close(actual[:, :128], primary)
+    torch.testing.assert_close(actual[:, 128:], wrist)
 
-    assert patches.shape == (512, 64)
-    restored = torch.nn.functional.fold(
-        patches.transpose(0, 1).unsqueeze(0),
-        output_size=(128, 256),
-        kernel_size=8,
-        stride=8,
-    ).squeeze(0).squeeze(0)
-    torch.testing.assert_close(restored, combined)
+
+def test_dynamic_motion_vectors_become_strict_binary_patch_labels() -> None:
+    adapter = _adapter()
+    motion = torch.zeros(16, 2)
+    motion[:2] = torch.tensor([2.0, 0.0])
+    motion[4:6] = torch.tensor([2.0, 0.0])
+    motion[2:4] = torch.tensor([0.5, 0.0])
+    motion[6:8] = torch.tensor([0.5, 0.0])
+
+    mask = adapter._dynamic_to_patch_mask(motion, patch_size=2)
+
+    assert mask.shape == (4, 1)
+    assert set(mask.flatten().tolist()) <= {0.0, 1.0}
+    torch.testing.assert_close(mask.flatten(), torch.tensor([1.0, 0.0, 0.0, 0.0]))
+
+
+def test_dense_dynamic_scores_are_binarized_after_patch_pooling() -> None:
+    adapter = _adapter()
+    scores = torch.zeros(4, 4)
+    scores[:2, :2] = 0.75
+    scores[:2, 2:] = 0.25
+
+    mask = adapter._dynamic_to_patch_mask(scores, patch_size=2)
+
+    torch.testing.assert_close(mask.flatten(), torch.tensor([1.0, 0.0, 0.0, 0.0]))
