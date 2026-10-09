@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   printf '用法：bash scripts/train_dream_ablation.sh <实验 ID> [--dry-run]\n'
-  printf '实验 ID：none dyn depth dino sam all all_no_sup\n'
+  printf '实验 ID：none dyn depth dino sam all all_no_sup all_no_dino all_no_sam all_no_depth all_no_dyn\n'
   printf '默认使用 GPU 0,1,2,3；缺少 accelerate 时自动使用 fastwam Conda 环境。\n'
 }
 
@@ -31,6 +31,10 @@ case "$group" in
   sam)        active='[sam]'; sam=1 ;;
   all)        active='[dyn,depth,dino,sam]'; dyn=1; depth=1; dino=1; sam=1 ;;
   all_no_sup) active='[dyn,depth,dino,sam]' ;;
+  all_no_dino) active='[dyn,depth,sam]'; dyn=1; depth=1; sam=1 ;;
+  all_no_sam)  active='[dyn,depth,dino]'; dyn=1; depth=1; dino=1 ;;
+  all_no_depth) active='[dyn,dino,sam]'; dyn=1; dino=1; sam=1 ;;
+  all_no_dyn)  active='[depth,dino,sam]'; depth=1; dino=1; sam=1 ;;
   *) printf '未知实验：%s\n' "$group" >&2; exit 1 ;;
 esac
 
