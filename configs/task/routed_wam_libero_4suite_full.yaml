@@ -1,0 +1,61 @@
+# @package _global_
+#
+# Full-intensity four-suite LIBERO run, matched to the reference recipe in
+# an internal 16-GPU DINO full-resolution recipe:
+#
+#   reference : 50,000 steps x global batch 128 = 6.40M samples, 16 GPUs,
+#               warmup 3,000 steps (6.0%), data_mix=libero_all (all four suites)
+#   here      : 12,500 steps x global batch 512 = 6.40M samples, 16 GPUs
+#
+# The *sample budget* is what is matched, not the step count. FastWAM's global
+# batch is 512 (32 per device x 16), four times the reference's 128, so copying
+# `max_steps: 50000` verbatim would quadruple the compute to ~104 h rather than
+# reproduce the recipe. At the measured 68.3 samples/s on 2x8 PPU, 6.40M samples
+# is ~26 h of wall clock -- so WALL_TIME must be set well past the 20,000 s the
+# reference job uses, and `save_every` must be tight enough that a preemption
+# costs minutes rather than hours.
+#
+# `num_epochs` is left large and `max_steps` does the terminating: the four
+# suites together are ~1,700 steps/epoch at this batch, so 12,500 steps is ~7.4
+# epochs. (On libero_goal alone it would have been ~120 epochs -- which is why
+# this config exists instead of reusing routed_wam_libero_goal.)
+
+defaults:
+  - override /data: libero_dream_4suite_2cam
+  - override /model: routed_wam
+  - _self_
+
+output_dir: ./runs/routed_wam_libero_4suite_full/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+batch_size: 32
+num_workers: 4
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+# Terminated by max_steps; this only has to be large enough not to end first.
+num_epochs: 64
+max_steps: 12500
+log_every: 10
+# ~26 h at 0.13 step/s means a preemption late in training is expensive. 500
+# steps is ~64 min of progress at risk, and the checkpoints go to the bucket.
+save_every: 500
+eval_every: 0
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+# The split Video-once prefill is only exact while the Video expert's K/V do not
+# depend on the diffusion step, which requires it to stay frozen.
+freeze_video_expert: true
+
+model:
+  mot_checkpoint_mixed_attn: true
+  loss:
+    # The split path never denoises future video frames, so lambda_video must be
+    # zero; the video branch contributes the current-frame world representation.
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_dream: 0.1
+  router:
+    # Pinned so the published curves are attributable to the swept knob rather
+    # than to the grouping. `modality_horizon_camera` is the granularity the
+    # perception-phase analysis needs (primary vs wrist, t0 vs t1).
+    group_granularity: modality_horizon_camera

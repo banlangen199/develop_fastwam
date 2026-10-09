@@ -18,6 +18,13 @@
 #   bash scripts/train_routed_zero1.sh 8 task=routed_wam_libero_goal
 set -euo pipefail
 
+# Every path below (`scripts/accelerate_configs/...`, `scripts/train_routed_wam.py`)
+# is relative to the repository root. When a job scheduler invokes this script
+# directly rather than through a wrapper that has already cd'd, accelerate dies
+# with "The passed configuration file ... does not exist", so cd here.
+REPO_ROOT="${WORKING_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "${REPO_ROOT}"
+
 NPROC_PER_NODE="${1:?Usage: bash scripts/train_routed_zero1.sh <nproc_per_node> [hydra_overrides...]}"
 shift
 EXTRA_ARGS=("$@")
@@ -44,7 +51,13 @@ for arg in "${EXTRA_ARGS[@]}"; do
 done
 
 RUN_ID="${RUN_ID:-$(date +%Y-%m-%d_%H-%M-%S)_${RANDOM}}"
-RUN_DIR="./runs/${TASK_BASENAME}/${RUN_ID}"
+
+# On a scheduler where `./runs` lives inside a container that disappears with
+# the job, every checkpoint would go with it. Point FASTWAM_RUN_ROOT at a
+# mounted path and the run writes there directly, so a preempted job keeps its
+# outputs and no separate copy-back step can be forgotten.
+RUN_ROOT="${FASTWAM_RUN_ROOT:-./runs}"
+RUN_DIR="${RUN_ROOT}/${TASK_BASENAME}/${RUN_ID}"
 
 if (( MACHINE_RANK == 0 )); then
   mkdir -p "${RUN_DIR}"

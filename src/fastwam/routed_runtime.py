@@ -41,6 +41,7 @@ def create_routed_wam(
     interface_distill: dict[str, Any] | DictConfig | None = None,
     generative_dream: dict[str, Any] | DictConfig | None = None,
     dream_scheduler: dict[str, Any] | DictConfig | None = None,
+    online_dream_targets: dict[str, Any] | DictConfig | None = None,
     finetune_action_only: bool = False,
     training_mode: str = "joint",
     active_dream_modalities=None,
@@ -55,6 +56,7 @@ def create_routed_wam(
         interface_distill=_to_container(interface_distill),
         generative_dream=_to_container(generative_dream),
         dream_scheduler=_to_container(dream_scheduler),
+        online_dream_targets=_to_container(online_dream_targets),
         finetune_action_only=bool(finetune_action_only),
         training_mode=training_mode,
     )

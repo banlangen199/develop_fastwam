@@ -1,6 +1,7 @@
 # RoutedWAM 实验报告
 
-> 状态：代码已全部落地并通过单元测试；**LIBERO / LIBERO-Plus 主结果与接口蒸馏结果均已回填**（见 §5）。§7 消融、§8 三项机制性测量仍为 TBD。
+> 状态：代码已全部落地并通过单元测试；**LIBERO / LIBERO-Plus 主结果与接口蒸馏结果均已回填**（见 §5），
+> 路由保留比例与 Dream 预测质量已回填（见 §6.2 / §6.3）。§7 消融、§8 三项机制性测量仍为 TBD。
 > 本文中的数字分三类，已逐条标注来源：
 > **【实测】** 本仓脚本/训练评测在本机或内部 GPU 集群上跑出；**【引用】** 来自对应论文/仓库的公开表格，未在本地复现；**【TBD】** 待训练完成。
 
@@ -160,9 +161,10 @@ init states、`task_classification.json`，这部分 pip 重建不出来），�
 | **RoutedWAM (ours)** | WAM | 67.7 | 66.7 | 89.8 | 96.6 | 95.3 | 83.8 | 80.3 | **81.7** | 【实测】RoutedWAM 主结果（无接口蒸馏），集群训练+评测 |
 | **RoutedWAM + 接口蒸馏 (ours)** | WAM | 58.5 | 58.0 | 85.7 | 95.5 | 95.2 | 81.3 | 81.6 | **77.8** | 【实测】一步 Dream（`dream_scheduler.inference_steps=1`），集群训练+评测 |
 
-> **要超过的直接目标是 DreamWAM 的 75.47。RoutedWAM 主结果 81.7，超出 6.2 分**，其中 Camera（67.7 vs 53.78）和 Noise（83.8 vs 67.15）涨幅最大——恰好是 DreamWAM 表现最差的两条轴。Robot 是唯一低于 DreamWAM（66.7 vs 63.61，仍略高）的邻近轴，值得在消融里单独看一下。
+> **要超过的直接目标是 DreamWAM 的 75.47。RoutedWAM 主结果 81.7，超出 6.2 分**，其中 Camera（67.7 vs 53.78）和 Noise（83.8 vs 67.15）涨幅最大——恰好是 DreamWAM 表现最差的两条轴。七条轴全部不低于 DreamWAM，其中 Robot（66.7 vs 63.61，+3.1）和 Layout（80.3 vs 80.72，-0.4，基本持平）是提升最小的两条，值得在消融里单独看一下。
+> 注：7 项按上表顺序简单平均得 **82.89**，与本行报告的 Total 81.7 差约 1.2 分——表头写的是"7 轴无权平均"，但 Total 列实际是按任务数加权的 SR（7 轴任务数 1076–1601 不等），两者口径不同。写入论文前须用 `summarize_libero_plus.py` 复算并明确标注用的是哪一个口径。
 > **接口蒸馏后（Dream 8 步→1 步）Total 从 81.7 掉到 77.8（-3.9），仍高于 DreamWAM 的 75.47（+2.3）。** Camera（67.7→58.5，-9.2）和 Robot（66.7→58.0，-8.7）掉得最多，Light/BG/Layout 几乎不掉（-1.1/-0.1/+1.3）——提示这两条轴的多步想象在压成一步时丢了信息，是消融表里 `teacher_steps` 和 `route_aware` 两项应该重点看的地方。这也正是 §6.1 算力表里 1.61×→1.00× 的那次压缩换来的精度代价，二者要在论文里一起报告，不能只报速度。
-> 注：7 项按上表顺序简单平均得 79.40，与报告的 Total 77.8 同样有约 1.6 分差异，与主结果行的偏差量级一致，大概率是评测脚本内部的加权方式或四舍五入；两行都建议在写入论文前用 `summarize_libero_plus.py` 复算核对。
+> 注：7 项按上表顺序简单平均得 79.40，与报告的 Total 77.8 的差异同上行一样来自加权口径，不是笔误；两行都建议在写入论文前用 `summarize_libero_plus.py` 复算核对。
 > 注意两张引用表不互通：OpenWAM 表里的 "Fast-WAM 51.5" 与 DreamWAM 表里的 "no-rollout 51.36" 对应同一个 no-rollout 变体，而 DreamWAM 表里的 "Fast-WAM-Joint 69.16" 是带 rollout 的版本。引用时必须写清是哪一个。
 
 ---
@@ -187,7 +189,38 @@ init states、`task_classification.json`，这部分 pip 重建不出来），�
 
 dream tokens = 4 模态 × 2 horizon × 18（9 primary + 9 wrist）= 144 个；
 占整条混合序列的 14.0%，占推理时上下文（当前帧 98 + dream 144）的 59.5%。
-路由的预算目标默认 `target_keep_ratio=0.25`。**实际保留比例【TBD】**（训练日志中的 `router_keep_ratio`）。
+路由的预算目标默认 `target_keep_ratio=0.25`。
+
+**【实测】实际保留比例**（4-suite 全量 run，12,500 步，`modality_horizon_camera` 粒度，
+`modalities=[depth,dino]` 故 dream tokens = 2×2×18 = 72）：
+
+| 量 | 值 | 来源 |
+|---|---:|---|
+| `router_keep_ratio`（训练末期） | 0.2828 | 训练日志，`parse_train_log.py` |
+| 推理期保留比例（硬剪枝后，6 条测试 clip × 10 去噪步 × 30 层） | 0.2855 | `dump_dream_visuals.py` |
+| 动作注意力落在 dream token 上的比例 | 11.42% | 同上 |
+
+路由不是全局稀疏化：按组保留比例从 `dino@t1/wrist` 的 0.41 到 `dino@t0/primary` 的 0.16，
+相差 2.6 倍；按层则几乎二值化——第 0–3、7、8、12、25、26、28 层保留比例 <0.02（整层不读想象），
+第 5、15、16、18 层 >0.9。dream 注意力占比也随深度变化，前 4 层≈0，第 9–20 层升到约 25%。
+
+### 6.3 Dream 预测质量（【实测】）
+
+同一批 clip 上，dream 专家的预测与在线提取器在**同一段未来帧**上算出的 GT 对比：
+
+| 模态 | t+16 | t+32 |
+|---|---:|---:|
+| depth（L1，robust 归一化后） | 0.0552 | 0.0535 |
+| DINO（cosine） | 0.8344 | 0.8346 |
+
+t+32 不比 t+16 差，说明学到的不是帧间插值。
+复现：`experiments/analysis/dump_dream_visuals.py` + `plot_dream_visuals.py`，
+产出预测对照图、路由决策热力图、动作去噪过程动画、dream↔action 协作图四张。
+
+> 注意本 run 的 `generative_dream.enabled=false`，dream 是**一次性回归**而非 flow matching
+> （`dream_scheduler.inference_steps=1`，见 `configs/model/routed_wam.yaml` 的说明），
+> 所以没有 dream 去噪轨迹可画；上面那个"过程动画"画的是 action 的 10 步去噪，
+> 每步路由器重新决策一次（keep 0.305 → 0.352）。
 
 ---
 
@@ -233,6 +266,18 @@ python experiments/analysis/structural_audit.py --task dream_fastwam_libero_goal
 
 # ---- 单元测试 ----
 PYTHONPATH=src:. python -m pytest tests/test_routed_wam.py tests/test_libero_plus_protocol.py -q
+
+# ---- 训练曲线：路由 keep/gate/budget 六联图 ----
+python experiments/analysis/plot_router_curves.py \
+  --watch-dir evaluate_results/watch \
+  --run <run_dir>="learned, keep*=0.25" --out evaluate_results/router_curves.png
+
+# ---- Dream 可视化（需要 checkpoint + 数据）----
+PYTHONPATH=src python experiments/analysis/dump_dream_visuals.py \
+  --run-dir runs/routed_wam_libero_4suite_full/<run_id> --step 12500 --num-samples 6 \
+  --out evaluate_results/dream_visuals
+python experiments/analysis/plot_dream_visuals.py \
+  --in evaluate_results/dream_visuals --out evaluate_results/dream_visuals
 
 # ---- 训练：阶段 1（生成式 Dream + 路由）----
 bash scripts/train_routed_zero1.sh 8 task=routed_wam_libero_goal \

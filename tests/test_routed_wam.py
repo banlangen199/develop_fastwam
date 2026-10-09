@@ -199,6 +199,7 @@ def make_router(parts, **overrides) -> ImaginationRouter:
             name: int(getattr(dream_expert, f"n_{name}")) for name in dream_expert.modalities
         },
         granularity=config.group_granularity,
+        camera_token_split=dream_expert.camera_token_split,
     )
     return ImaginationRouter(
         config=config,
@@ -208,7 +209,6 @@ def make_router(parts, **overrides) -> ImaginationRouter:
         group_ids=group_ids,
         group_names=group_names,
     )
-
 
 # --------------------------------------------------------------------- tests
 def test_group_ids_follow_dream_token_layout():
@@ -431,14 +431,19 @@ def test_generative_expert_encodes_targets_into_the_dream_layout():
     }
     latent = expert.encode_targets(targets)
     assert latent.shape == (batch, expert.num_dream_tokens, expert.hidden_dim)
-    # out_scale is zero-initialised: conversion must not perturb a pretrained model.
-    assert torch.count_nonzero(latent) == 0
-
-    with torch.no_grad():
-        for encoder in expert.target_encoders.values():
-            encoder.out_scale.fill_(1.0)
-    latent = expert.encode_targets(targets)
+    # Default init_scale is 1: from scratch the branch must actually see its
+    # input. an internal run shows what a 0 init costs -- out_scale
+    # reached only 0.012 after 416 steps and loss_dream never left the
+    # conditional-mean baseline.
     assert torch.count_nonzero(latent) > 0
+
+    # init_scale=0 is still available, for converting a pretrained regression
+    # Dream without perturbing it.
+    zeroed = make_dream_expert(generative=False)
+    GenerativeDreamExpert.promote(
+        zeroed, {"enabled": True, "freq_dim": 8, "target_encoder_init_scale": 0.0}
+    )
+    assert torch.count_nonzero(zeroed.encode_targets(targets)) == 0
 
 
 def test_generative_pre_dit_consumes_noisy_latent_and_timestep():
@@ -569,6 +574,140 @@ def test_generative_dream_loss_masks_invalid_futures():
     assert float(loss_masked) == pytest.approx(0.0, abs=1e-6)
 
 
+def test_camera_grouping_matches_the_decoder_two_view_layout():
+    """primary/wrist grouping must agree with DenseDreamDecoder.forward_two_view.
+
+    Within one (modality, offset) block the first `camera_token_split[0]` tokens
+    are decoded as the primary view and the rest as the wrist view. If the group
+    map disagreed, every stage-dependent-perception figure would attribute
+    wrist evidence to the primary camera and vice versa -- a wrong conclusion
+    that no amount of downstream plotting would reveal.
+    """
+    ids, names = build_group_ids(
+        modalities=["depth", "dino"],
+        num_future_offsets=2,
+        tokens_per_modality={"depth": 4, "dino": 4},
+        granularity="modality_horizon_camera",
+        camera_token_split=(2, 2),
+    )
+    assert names == [
+        "depth@t0/primary", "depth@t0/wrist",
+        "depth@t1/primary", "depth@t1/wrist",
+        "dino@t0/primary", "dino@t0/wrist",
+        "dino@t1/primary", "dino@t1/wrist",
+    ]
+    # depth: [t0 primary x2, t0 wrist x2, t1 primary x2, t1 wrist x2], then dino.
+    assert ids.tolist() == [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]
+
+    ids, names = build_group_ids(
+        modalities=["depth", "dino"],
+        num_future_offsets=2,
+        tokens_per_modality={"depth": 4, "dino": 4},
+        granularity="modality_camera",
+        camera_token_split=(2, 2),
+    )
+    assert names == ["depth/primary", "depth/wrist", "dino/primary", "dino/wrist"]
+    # Horizons collapse, cameras do not.
+    assert ids.tolist() == [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]
+
+
+def test_camera_grouping_requires_a_camera_split():
+    with pytest.raises(ValueError, match="camera_token_split"):
+        build_group_ids(
+            modalities=["depth"],
+            num_future_offsets=1,
+            tokens_per_modality={"depth": 4},
+            granularity="modality_camera",
+            camera_token_split=None,
+        )
+    with pytest.raises(ValueError, match="must sum to"):
+        build_group_ids(
+            modalities=["depth"],
+            num_future_offsets=1,
+            tokens_per_modality={"depth": 4},
+            granularity="modality_camera",
+            camera_token_split=(3, 3),
+        )
+
+
+def _run_split_path(routed, parts):
+    """Video-once prefill -> Dream -> cached Action, the split training path."""
+    video_seq_len = parts["video_seq_len"]
+    dream_seq_len = parts["dream_seq_len"]
+    context_seq_len = video_seq_len + dream_seq_len
+    mask = parts["mask"]
+    video_kv = routed.prefill_video_cache(
+        video_tokens=parts["embeds"]["video"],
+        video_freqs=parts["freqs"]["video"],
+        video_t_mod=parts["t_mod"]["video"],
+        video_context_payload=None,
+        video_attention_mask=mask[:video_seq_len, :video_seq_len],
+    )
+    dream_out = routed.forward_dream_with_video_cache(
+        dream_tokens=parts["embeds"]["dream"],
+        dream_freqs=parts["freqs"]["dream"],
+        dream_t_mod=parts["t_mod"]["dream"],
+        dream_context_payload=None,
+        video_kv_cache=video_kv,
+        context_attention_mask=mask[:context_seq_len, :context_seq_len],
+        video_seq_len=video_seq_len,
+    )
+    return routed.forward_action_with_context_cache(
+        action_tokens=parts["embeds"]["action"],
+        action_freqs=parts["freqs"]["action"],
+        action_t_mod=parts["t_mod"]["action"],
+        action_context_payload=None,
+        context_kv_cache=routed.merge_context_cache(video_kv, dream_out["dream_kv"]),
+        attention_mask=mask,
+        video_seq_len=video_seq_len,
+        dream_seq_len=dream_seq_len,
+    )
+
+
+def test_cached_path_collects_gates_so_the_budget_loss_is_live():
+    """Regression: the split path must feed `budget_loss`, not silently skip it.
+
+    `routed_wam` trains through the cached Action path, not `forward`. When the
+    gate was only collected in `forward`, `budget_loss` received an empty list,
+    returned a constant zero, and the router never felt any pruning pressure --
+    visible in training logs as `loss_router_budget=0.0000` with a keep ratio
+    frozen at `sigmoid(bias_init)`.
+    """
+    parts = make_parts()
+    router = make_router(
+        parts, mode="learned", rank=4, lambda_budget=1.0, target_keep_ratio=0.2
+    )
+    routed = RoutedMoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False, router=router)
+    routed.train()
+
+    _run_split_path(routed, parts)
+
+    assert len(routed.last_gates) == LAYERS, (
+        f"expected one gate per layer, got {len(routed.last_gates)}"
+    )
+    budget = router.budget_loss(routed.last_gates)
+    assert budget.requires_grad, "budget loss is detached from the router"
+    assert float(budget.detach()) > 0.0, "budget loss is zero: the router gets no pruning pressure"
+
+    budget.backward()
+    grads = [p.grad for p in router.parameters() if p.grad is not None]
+    assert grads and any(float(g.abs().sum()) > 0 for g in grads), (
+        "budget loss produced no router gradient"
+    )
+
+
+def test_cached_path_does_not_leak_gates_between_forwards():
+    parts = make_parts()
+    router = make_router(parts, mode="learned", rank=4, lambda_budget=1.0)
+    routed = RoutedMoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False, router=router)
+    routed.eval()
+    with torch.no_grad():
+        _run_split_path(routed, parts)
+        first = len(routed.last_gates)
+        _run_split_path(routed, parts)
+    assert len(routed.last_gates) == first == LAYERS
+
+
 def test_task_configs_compose_and_select_the_routed_factory():
     pytest.importorskip("hydra")
     from hydra import compose, initialize_config_dir
@@ -588,7 +727,11 @@ def test_task_configs_compose_and_select_the_routed_factory():
             cfg = compose(config_name="train", overrides=[f"task={task}"])
             model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
             assert model_cfg["_target_"] == "fastwam.routed_runtime.create_routed_wam"
-            assert model_cfg["generative_dream"]["enabled"] is True
+            # Regression Dream by default: flow matching in target space is not
+            # well posed through the 57x Dream bottleneck (measured, E1-E6).
+            assert model_cfg["generative_dream"]["enabled"] is False
+            assert float(model_cfg["generative_dream"]["target_encoder_init_scale"]) == 1.0
+            assert model_cfg["online_dream_targets"]["enabled"] is True
             assert model_cfg["interface_distill"]["enabled"] is distill_enabled
             # The split path cannot denoise future video frames.
             assert float(model_cfg["loss"]["lambda_video"]) == 0.0
@@ -639,3 +782,159 @@ def test_interface_convergence_measures_both_drifts():
     assert result["per_step"][-1]["interface_drift"] == pytest.approx(0.0, abs=1e-6)
     assert result["per_step"][-1]["output_drift"] == pytest.approx(0.0, abs=1e-6)
     assert result["per_step"][0]["output_drift"] > 0.0
+
+
+def test_every_model_config_key_is_accepted_by_the_factory():
+    """Guard against a config key silently falling through to the dense factory.
+
+    `create_routed_wam` forwards `**dream_fastwam_kwargs` to
+    `create_dream_fastwam`, so a routed-only key that is not named explicitly
+    reaches the wrong function and the job dies at construction time with
+    `got an unexpected keyword argument` -- after queueing, after the image
+    pulls, after 16 ranks have started (an internal run).
+
+    Nothing here builds a model, so it runs without Wan2.2 weights.
+    """
+    pytest.importorskip("hydra")
+    import inspect
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from fastwam.routed_runtime import create_routed_wam
+    from fastwam.runtime import create_dream_fastwam
+    from fastwam.utils.config_resolvers import register_default_resolvers
+
+    register_default_resolvers()
+    config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
+        cfg = compose(config_name="train", overrides=["task=routed_wam_libero_goal"])
+    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+
+    routed_params = set(inspect.signature(create_routed_wam).parameters)
+    dense_params = set(inspect.signature(create_dream_fastwam).parameters)
+    accepted = routed_params | dense_params
+
+    unknown = sorted(k for k in model_cfg if k != "_target_" and k not in accepted)
+    assert not unknown, (
+        f"model config keys {unknown} are accepted by neither create_routed_wam nor "
+        "create_dream_fastwam; they would be forwarded to the wrong factory"
+    )
+    # And the routed-only keys must be named on the routed factory specifically,
+    # not swallowed by **kwargs and passed down to the dense one.
+    for key in ("router", "interface_distill", "generative_dream",
+                "dream_scheduler", "online_dream_targets", "finetune_action_only"):
+        assert key in routed_params, f"{key} must be an explicit create_routed_wam parameter"
+
+
+def test_dream_step_works_without_a_noisy_target():
+    """The regression Dream path must run through `_dream_step` too.
+
+    The generative and regression objectives were branched in
+    `_split_training_loss`, but `_dream_step` still called `encode_targets`
+    unconditionally -- which raises when there is no noisy target. Every rank of
+    jobs  and its five siblings died on it, and no test
+    caught it because the stub tests only ever exercised the generative path.
+    """
+    parts = make_parts(generative=False)          # regression Dream
+    model = _stub_routed_model(parts)
+    video_seq_len = parts["video_seq_len"]
+    context_seq_len = video_seq_len + parts["dream_seq_len"]
+    mask = parts["mask"]
+
+    with torch.no_grad():
+        video_kv = model.mot.prefill_video_cache(
+            video_tokens=parts["embeds"]["video"],
+            video_freqs=parts["freqs"]["video"],
+            video_t_mod=parts["t_mod"]["video"],
+            video_context_payload=None,
+            video_attention_mask=mask[:video_seq_len, :video_seq_len],
+        )
+        out = model._dream_step(
+            noisy_targets=None,                   # the regression case
+            timestep=None,
+            context=None,
+            context_mask=None,
+            video_kv_cache=video_kv,
+            context_attention_mask=mask[:context_seq_len, :context_seq_len],
+            video_seq_len=video_seq_len,
+            batch_size=parts["batch"],
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+    assert set(out["prediction"]) == {"depth", "dino"}
+    assert out["prediction"]["depth"].shape[:2] == (parts["batch"], parts["dream_expert"].num_future_offsets)
+    assert len(out["dream_kv"]) == LAYERS
+    for entry in out["dream_kv"]:
+        assert entry["k"].shape == (parts["batch"], parts["dream_seq_len"], INNER)
+
+
+# ---------------------------------------------------------------------------
+# TensorBoard mirroring
+# ---------------------------------------------------------------------------
+def test_routed_trainer_mirrors_scalars_to_tensorboard():
+    """Every logged scalar must reach TensorBoard, including router statistics.
+
+    `_wandb_log` is the single funnel the base trainer pushes metrics through, so
+    hooking it is what keeps the two sinks in lockstep. The router group tags
+    (`router_keep_dino@t1/wrist`) are the ones that matter here -- they are the
+    reason the mirror exists, and they contain `@` and `/`, so a tag-sanitising
+    bug would drop exactly the series being investigated.
+    """
+    from fastwam.routed_trainer import RoutedWan22Trainer
+
+    class FakeWriter:
+        def __init__(self):
+            self.scalars = []
+            self.flushed = 0
+            self.closed = False
+
+        def add_scalar(self, tag, value, step):
+            self.scalars.append((tag, float(value), step))
+
+        def flush(self):
+            self.flushed += 1
+
+        def close(self):
+            self.closed = True
+
+    # Built without __init__: a real trainer needs accelerate, a dataset and a
+    # 5B model, none of which this behaviour depends on.
+    trainer = object.__new__(RoutedWan22Trainer)
+    writer = FakeWriter()
+    trainer._tb_writer = writer
+    trainer.global_step = 70
+    trainer.wandb_run = None
+
+    payload = {
+        "train/loss": 0.5,
+        "train/router_gate_mean": 0.31,
+        "train/router_keep_dino@t1/wrist": 0.678,
+        "train/not_a_scalar": object(),
+    }
+    trainer._wandb_log(payload)
+
+    tags = {tag for tag, _, _ in writer.scalars}
+    assert "train/router_keep_dino@t1/wrist" in tags, (
+        "router group tags were dropped: these are the curves the mirror exists for"
+    )
+    assert "train/router_gate_mean" in tags
+    assert "train/not_a_scalar" not in tags, "non-scalar payloads must be skipped, not crash"
+    assert all(step == 70 for _, _, step in writer.scalars)
+    assert writer.flushed >= 1, "events not flushed: a running job would show nothing"
+
+    trainer._finish_wandb()
+    assert writer.closed and trainer._tb_writer is None
+
+
+def test_routed_trainer_without_tensorboard_is_a_noop():
+    """A missing writer must not break logging -- a 26 h job cannot die for a chart."""
+    from fastwam.routed_trainer import RoutedWan22Trainer
+
+    trainer = object.__new__(RoutedWan22Trainer)
+    trainer._tb_writer = None
+    trainer.global_step = 1
+    trainer.wandb_run = None
+    trainer._wandb_log({"train/loss": 1.0})
+    trainer._finish_wandb()
