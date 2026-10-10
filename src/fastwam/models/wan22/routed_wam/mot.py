@@ -60,11 +60,34 @@ class RoutedMoT(MoT):
         self.capture_kv = False
         self.captured_kv: list[dict[str, torch.Tensor]] = []
         self.last_gates: list[torch.Tensor] = []
-        # Analysis-only, default off: records where the action queries actually
-        # spend their attention, which is the one quantity the router's own
-        # statistics cannot report (a kept token may still be ignored).
+        self.last_group_gates: list[torch.Tensor] = []
         self.capture_action_attention = False
         self.captured_action_attention: list[dict[str, Any]] = []
+
+    @property
+    def last_token_gates(self) -> list[torch.Tensor]:
+        """Token gates; last_gates remains the interface-distillation compatible alias."""
+        return self.last_gates
+
+    def _reset_router_records(self) -> None:
+        self.last_gates = []
+        self.last_group_gates = []
+        if self.router is not None:
+            self.router.reset_statistics()
+
+    def _record_gate_info(self, layer_idx, gate_info) -> None:
+        # Called outside checkpointed functions: backward must not append records.
+        self.last_gates.append(gate_info["gate"])
+        if "group_gate" in gate_info:
+            self.last_group_gates.append(gate_info["group_gate"])
+        elif self.router.config.mode == "learned":
+            # PR #2 gates individual tokens; group means are for rollout export.
+            ids = self.router.group_ids.to(gate_info["gate"].device)
+            self.last_group_gates.append(torch.stack([
+                gate_info["gate"][:, ids == index].mean(dim=-1)
+                for index in range(len(self.router.group_names))
+            ], dim=-1))
+        self.router.record(layer_idx=layer_idx, **gate_info)
 
     # ------------------------------------------------------------------ utils
     @property
@@ -221,7 +244,7 @@ class RoutedMoT(MoT):
             q_action=q_action,
             k_video_current=k_video_current,
             k_dream=(k_all[:, dream_slice] if self.router.config.mode == "learned"
-                     and self.router.config.gate_type == "da" else None),
+                     and self.router.config.gate_type in {"bilinear", "da"} else None),
             dense_probs=dense_probs,
             dream_slice=dream_slice,
             n_valid=n_valid,
@@ -292,9 +315,7 @@ class RoutedMoT(MoT):
         attention_layers: Optional[list[int]] = None,
         return_router_statistics: bool = False,
     ):
-        # Reset before the early return too: a stale gate list from a previous
-        # forward must never reach `budget_loss`.
-        self.last_gates = []
+        self._reset_router_records()
         if not self.routing_enabled and not self.capture_kv:
             return super().forward(
                 embeds_all=embeds_all,
@@ -505,27 +526,11 @@ class RoutedMoT(MoT):
                 context_slices=context_slices,
                 layer_idx=layer_idx,
             )
-        out, gate_info = self._routed_action_attention(
-            q_action=q_action,
-            k_all=k_all,
-            v_all=v_all,
-            attention_mask=attention_mask,
-            action_slice=action_slice,
-            dream_slice=context_slices["dream"],
-            layer_idx=layer_idx,
-        )
-        # The split training path (Video-once / Dream / Action-cached) runs
-        # through here, not through `forward`. Collecting the gate is what makes
-        # `ImaginationRouter.budget_loss` see anything: without it the budget
-        # term silently evaluates to zero, the router gets no pruning pressure,
-        # and the gate stays pinned at its `sigmoid(bias_init)` initialisation.
-        self.last_gates.append(gate_info["gate"])
-        if self.router is not None:
-            self.router.record(
-                layer_idx=layer_idx,
-                gate=gate_info["gate"],
-                keep=gate_info["keep"],
-                score=gate_info["score"],
+        def attend(q, k, v):
+            return self._routed_action_attention(
+                q_action=q, k_all=k, v_all=v, attention_mask=attention_mask,
+                action_slice=action_slice, dream_slice=context_slices["dream"],
+                video_slice=context_slices["video"], layer_idx=layer_idx,
             )
 
         if self.mot_checkpoint_mixed_attn and self.training:
@@ -539,11 +544,8 @@ class RoutedMoT(MoT):
         return out
 
     def forward_action_with_context_cache(self, *args, **kwargs) -> torch.Tensor:
-        # Both the statistics and the collected gates belong to one forward;
-        # stale gates from a previous call would corrupt the budget loss.
-        self.last_gates = []
-        if self.router is not None:
-            self.router.reset_statistics()
+        # Each Action forward (or denoising step) owns a fresh gate graph.
+        self._reset_router_records()
         return super().forward_action_with_context_cache(*args, **kwargs)
 
     # --------------------------------------------- split Video/Dream prefill

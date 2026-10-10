@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,6 @@ def create_routed_wam(
     interface_distill: dict[str, Any] | DictConfig | None = None,
     generative_dream: dict[str, Any] | DictConfig | None = None,
     dream_scheduler: dict[str, Any] | DictConfig | None = None,
-    online_dream_targets: dict[str, Any] | DictConfig | None = None,
     finetune_action_only: bool = False,
     training_mode: str = "joint",
     active_dream_modalities=None,
@@ -56,10 +56,34 @@ def create_routed_wam(
         interface_distill=_to_container(interface_distill),
         generative_dream=_to_container(generative_dream),
         dream_scheduler=_to_container(dream_scheduler),
-        online_dream_targets=_to_container(online_dream_targets),
         finetune_action_only=bool(finetune_action_only),
         training_mode=training_mode,
     )
+
+
+def _save_training_config(cfg: DictConfig) -> None:
+    # Accelerate sets RANK before torch.distributed is initialized here.
+    rank = (torch.distributed.get_rank() if torch.distributed.is_initialized()
+            else int(os.environ.get("RANK", "0")))
+    if rank != 0:
+        return
+
+    # On resume, other ranks may still be composing this same config in Hydra.
+    # Never truncate it in place: readers must see a complete old or new file.
+    config_path = Path(cfg.output_dir) / "config.yaml"
+    config_payload = OmegaConf.to_container(cfg, resolve=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=config_path.parent,
+            prefix=".config.", suffix=".yaml", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            OmegaConf.save(config_payload, handle)
+        os.replace(temporary_path, config_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def run_routed_training(cfg: DictConfig) -> None:
@@ -69,9 +93,7 @@ def run_routed_training(cfg: DictConfig) -> None:
         is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
     )
     misc.register_work_dir(cfg.output_dir)
-    config_payload = OmegaConf.to_container(cfg, resolve=True)
-    with open(Path(cfg.output_dir) / "config.yaml", "w", encoding="utf-8") as handle:
-        OmegaConf.save(config_payload, handle)
+    _save_training_config(cfg)
 
     model_device = _resolve_train_device()
     from .utils.pytorch_utils import set_global_seed

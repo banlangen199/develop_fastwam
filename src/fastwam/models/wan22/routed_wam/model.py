@@ -1,4 +1,4 @@
-"""RoutedWAM: direct Dream regression with Video/Action-conditioned group routing.
+"""RoutedWAM: the 9e37dbb Dream expert with PR #2 imagination routing.
 
 The default Dream expert predicts future targets in one forward, without Dream
 noise or denoising. Action retains its flow-matching objective. The optional
@@ -9,10 +9,10 @@ generative and distillation paths remain available for legacy experiments:
     regressing them (:mod:`generative_dream`).
 
 ``router``
-    Per-layer sigmoid Dream group priors use Video + Action (VA), Dream + Action
-    (DA), or input-independent learned logits (S). The existing shared
-    mixed attention receives +log(gate) on Dream logits (:mod:`router`).
-    The earlier full/static/dynamic QK scaling experiments remain selectable.
+    PR #2's bilinear Action-query / Dream-key score produces one gate per token,
+    with a keep-budget loss. The shared mixed attention receives +log(gate) on
+    Dream logits (:mod:`router`). Earlier group-prior and QK-scaling ablations
+    remain explicitly selectable.
 
 ``interface_distill``
     A one-step Dream pass is trained to reproduce the per-layer Dream K/V of an
@@ -35,13 +35,11 @@ import torch.nn.functional as F
 from fastwam.utils.logging_config import get_logger
 
 from ..dream_fastwam.model import DreamFastWAM
-from ..fastwam.model import FastWAM
 from ..schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .generative_dream import GenerativeDreamExpert
 from .interface_distill import InterfaceDistillConfig, InterfaceDistiller
 from .mot import RoutedMoT
-from .online_targets import OnlineDreamTargets, OnlineTargetConfig
-from .router import ImaginationRouter, RouterConfig, build_group_ids
+from .router import DynamicFeatureRouter, ImaginationRouter, RouterConfig, build_group_ids
 
 
 logger = get_logger(__name__)
@@ -75,7 +73,6 @@ class RoutedWAM(DreamFastWAM):
         interface_distill: Optional[dict[str, Any]] = None,
         generative_dream: Optional[dict[str, Any]] = None,
         dream_scheduler: Optional[dict[str, Any]] = None,
-        online_dream_targets: Optional[dict[str, Any]] = None,
         finetune_action_only: bool = False,
         training_mode: str = "joint",
         **kwargs,
@@ -87,7 +84,6 @@ class RoutedWAM(DreamFastWAM):
             interface_distill=interface_distill,
             generative_dream=generative_dream,
             dream_scheduler=dream_scheduler,
-            online_dream_targets=online_dream_targets,
             finetune_action_only=finetune_action_only,
             training_mode=training_mode,
         )
@@ -101,7 +97,6 @@ class RoutedWAM(DreamFastWAM):
         interface_distill: Optional[dict[str, Any]] = None,
         generative_dream: Optional[dict[str, Any]] = None,
         dream_scheduler: Optional[dict[str, Any]] = None,
-        online_dream_targets: Optional[dict[str, Any]] = None,
         finetune_action_only: bool = False,
         training_mode: str = "joint",
     ) -> "RoutedWAM":
@@ -111,7 +106,6 @@ class RoutedWAM(DreamFastWAM):
         router_config = RouterConfig.from_dict(router)
         distill_config = InterfaceDistillConfig.from_dict(interface_distill)
         generative_config = dict(generative_dream or {})
-        online_config = OnlineTargetConfig.from_dict(online_dream_targets)
 
         model.__class__ = cls
         model.router_config = router_config
@@ -214,17 +208,6 @@ class RoutedWAM(DreamFastWAM):
                     "with a regression Dream there is only one step and nothing to distil."
                 )
 
-        # 5b. Online dream targets. The configured future offsets land on
-        # frames the clip already contains (video_sample_indices), so the
-        # targets can be extracted on device instead of being read back from
-        # tens of GB of precomputed `extras/`.
-        model.online_target_config = online_config
-        model.online_targets = OnlineDreamTargets(online_config) if online_config.enabled else None
-        # Frames kept per video frame; 4 for LIBERO (33 raw -> 9 video frames).
-        model.online_action_video_freq_ratio = 4
-        if model.online_targets is not None:
-            model.online_targets.to(device=model.device, dtype=model.torch_dtype)
-
         logger.info(
             "Installed RoutedWAM: router=%s generative_dream=%s interface_distill=%s "
             "dream_inference_steps=%d action_only=%s",
@@ -245,11 +228,7 @@ class RoutedWAM(DreamFastWAM):
         train/test mismatch; it is mandatory for interface distillation, which
         needs the per-layer Dream K/V that only this path materialises.
         """
-        return (
-            bool(self.distill_config.enabled)
-            or bool(self.dream_expert.generative_enabled)
-            or self.online_targets is not None
-        )
+        return bool(self.distill_config.enabled) or bool(self.dream_expert.generative_enabled)
 
     def set_training_progress_provider(self, provider) -> None:
         self._training_progress_provider = provider
@@ -461,8 +440,8 @@ class RoutedWAM(DreamFastWAM):
     def _dream_step(
         self,
         *,
-        noisy_targets: dict[str, torch.Tensor],
-        timestep: torch.Tensor,
+        noisy_targets: Optional[dict[str, torch.Tensor]],
+        timestep: Optional[torch.Tensor],
         context: torch.Tensor,
         context_mask: torch.Tensor,
         video_kv_cache: list[dict[str, torch.Tensor]],
@@ -477,17 +456,9 @@ class RoutedWAM(DreamFastWAM):
         Returns the predicted per-modality velocity, the advanced Dream tokens and
         the per-layer Dream K/V -- the interface the action expert will read.
         """
-        # A regression Dream has no noisy target to encode: its tokens are the
-        # learnable queries alone, exactly as in DreamFastWAM. Calling
-        # encode_targets unconditionally raised on every rank of a six-run sweep.
-        latent = (
-            self.dream_expert.encode_targets(noisy_targets)
-            if noisy_targets is not None
-            else None
-        )
-        # Only pass the generative kwargs when there is something to pass: a
-        # plain DreamQueryExpert does not accept them at all, and relying on the
-        # expert always having been promoted is a dependency worth not having.
+        # Distillation temporarily swaps the active MoT expert. The encoder,
+        # timestep embedding and decoder must follow the blocks being used.
+        dream_expert = self.mot.mixtures["dream"]
         dream_kwargs = dict(
             batch_size=batch_size,
             device=device,
@@ -495,9 +466,13 @@ class RoutedWAM(DreamFastWAM):
             context=context,
             context_mask=context_mask,
         )
-        if latent is not None or timestep is not None:
-            dream_kwargs.update(noisy_latent=latent, timestep=timestep)
-        dream_pre = self.dream_expert.pre_dit(**dream_kwargs)
+        if noisy_targets is not None:
+            dream_kwargs.update(
+                noisy_latent=dream_expert.encode_targets(noisy_targets),
+                timestep=timestep,
+                noisy_targets=noisy_targets,
+            )
+        dream_pre = dream_expert.pre_dit(**dream_kwargs)
         out = self.mot.forward_dream_with_video_cache(
             dream_tokens=dream_pre["tokens"],
             dream_freqs=dream_pre["freqs"],
@@ -919,15 +894,19 @@ class RoutedWAM(DreamFastWAM):
         router = self.mot.router
         if router is None:
             return loss, metrics
-        gates = self.mot.last_group_gates
+        bilinear = router.config.gate_type == "bilinear"
+        gates = self.mot.last_gates if bilinear else self.mot.last_group_gates
         if router.config.mode == "learned":
             if len(gates) != self.mot.num_layers:
                 raise RuntimeError(
-                    "Learned routing requires group gates from every Action layer; "
+                    "Learned routing requires gates from every Action layer; "
                     f"collected {len(gates)} of {self.mot.num_layers}."
                 )
-        # Gates are learned exclusively through Action loss. These are diagnostic
-        # metrics, with no budget, sparsity, entropy or gate-supervision objective.
+        if bilinear:
+            budget = router.budget_loss(gates)
+            if budget.requires_grad or float(budget.detach()) != 0.0:
+                loss = loss + budget
+            metrics["loss_router_budget"] = float(budget.detach())
         metrics["router_layers"] = len(gates)
         metrics["router_strength"] = router.current_strength()
         metrics.update(router.scalar_metrics())
@@ -958,14 +937,7 @@ class RoutedWAM(DreamFastWAM):
 
     def _split_training_loss(self, sample, tiled: bool = False):
         """Train through the deployment computation: Video once, Dream, Action cached."""
-        if self.online_targets is not None:
-            # Skip DreamFastWAM.build_inputs: it insists on `sample["dream_targets"]`,
-            # which only exists when precomputed extras are on disk. With online
-            # targets the dataset does not need to supply them at all, so
-            # data.train.dream_target.enabled can stay false.
-            inputs = FastWAM.build_inputs(self, sample, tiled=tiled)
-        else:
-            inputs = self.build_inputs(sample, tiled=tiled)
+        inputs = self.build_inputs(sample, tiled=tiled)
         if self.loss_lambda_video > 0.0:
             raise ValueError(
                 "The split path does not denoise future video frames; set "
@@ -979,27 +951,10 @@ class RoutedWAM(DreamFastWAM):
         context_mask = inputs["context_mask"]
         action = inputs["action"]
         action_is_pad = inputs["action_is_pad"]
-        if self.online_targets is not None:
-            # The future frames the offsets point at are already in this clip:
-            # video_sample_indices == [0, 4, ..., 32] and future_offsets are
-            # multiples of action_video_freq_ratio, so no extra I/O is needed.
-            online = self.online_targets(
-                sample["video"],
-                future_offsets=list(self.dream_expert.future_offsets),
-                action_video_freq_ratio=int(self.online_action_video_freq_ratio),
-                image_is_pad=inputs.get("image_is_pad", None),
-            )
-            dream_targets = self._dream_target_reference(online)
-            future_valid_mask = online["future_valid_mask"]
-            modality_valid_masks = {
-                name: online[f"{name}_valid_mask"]
-                for name in self.dream_expert.modalities
-                if f"{name}_valid_mask" in online
-            }
-        else:
-            dream_targets = self._dream_target_reference(inputs["dream_targets"])
-            future_valid_mask = inputs.get("future_valid_mask", None)
-            modality_valid_masks = inputs.get("modality_valid_masks", None)
+        dream_targets = self._dream_target_reference(inputs["dream_targets"])
+        future_valid_mask = inputs.get("future_valid_mask", None)
+        modality_valid_masks = inputs.get("modality_valid_masks", None)
+
         first_frame_latents = inputs["first_frame_latents"]
         if first_frame_latents is None:
             first_frame_latents = input_latents[:, :, 0:1]
@@ -1016,37 +971,22 @@ class RoutedWAM(DreamFastWAM):
         context_seq_len = prefill["video_seq_len"] + prefill["dream_seq_len"]
         context_attention_mask = prefill["attention_mask"][:context_seq_len, :context_seq_len]
 
-        # --- Dream ---
+        # --- Dream: one noised step, supervised in velocity space ---
         clean_targets = {name: value.to(dtype) for name, value in dream_targets.items()}
-        generative = bool(self.dream_expert.generative_enabled)
-        if generative:
-            # Flow matching in target space. NOTE this is only well posed when the
-            # Dream bottleneck can carry the denoising state: the velocity target
-            # `noise - x0` is per-token i.i.d., while the encoder compresses e.g.
-            # DINO's 256x768 per camera into 9x384 (57x). Recovering per-token
-            # noise from that is information-theoretically impossible, and a run
-            # with this on sits at loss_dream ~= 1 + var(y) -- the conditional
-            # mean -- which is what jobs E1-E6 measured.
-            dream_noise = self._sample_dream_noise(clean_targets)
-            timestep_dream = self.train_dream_scheduler.sample_training_t(
-                batch_size=batch_size, device=device, dtype=dtype
+        dream_noise = self._sample_dream_noise(clean_targets)
+        timestep_dream = self.train_dream_scheduler.sample_training_t(
+            batch_size=batch_size, device=device, dtype=dtype
+        )
+        noisy_targets = {
+            name: self.train_dream_scheduler.add_noise(value, dream_noise[name], timestep_dream)
+            for name, value in clean_targets.items()
+        }
+        velocity_targets = {
+            name: self.train_dream_scheduler.training_target(
+                value, dream_noise[name], timestep_dream
             )
-            noisy_targets = {
-                name: self.train_dream_scheduler.add_noise(value, dream_noise[name], timestep_dream)
-                for name, value in clean_targets.items()
-            }
-            supervision = {
-                name: self.train_dream_scheduler.training_target(
-                    value, dream_noise[name], timestep_dream
-                )
-                for name, value in clean_targets.items()
-            }
-        else:
-            # Regression Dream: predict the future target itself. Well posed at
-            # any bottleneck width, and what DreamFastWAM validates.
-            noisy_targets = None
-            timestep_dream = None
-            supervision = clean_targets
+            for name, value in clean_targets.items()
+        }
         dream_out = self._dream_step(
             noisy_targets=noisy_targets,
             timestep=timestep_dream,
@@ -1059,24 +999,13 @@ class RoutedWAM(DreamFastWAM):
             device=device,
             dtype=dtype,
         )
-        if generative:
-            loss_dream, dream_parts = self._generative_dream_loss(
-                dream_out["prediction"],
-                supervision,
-                future_valid_mask=future_valid_mask,
-                modality_valid_masks=modality_valid_masks,
-            )
-            dream_weight = self.train_dream_scheduler.training_weight(timestep_dream).mean()
-            loss_dream = loss_dream * dream_weight.to(loss_dream.dtype)
-        else:
-            # Reuse the parent's per-modality objectives (smooth-L1 for depth,
-            # 1 - cosine for DINO/SAM); a single MSE is only right for velocity.
-            loss_dream, dream_parts = self._compute_dream_loss(
-                dream_out["prediction"],
-                dict(supervision),
-                future_valid_mask=future_valid_mask,
-                modality_valid_masks=modality_valid_masks,
-            )
+        loss_dream, dream_parts = self._generative_dream_loss(
+            dream_out["prediction"],
+            velocity_targets,
+            future_valid_mask=future_valid_mask,
+            modality_valid_masks=modality_valid_masks,
+            sample_weights=self.train_dream_scheduler.training_weight(timestep_dream),
+        )
 
         # --- Action: denoise against the merged cache ---
         noise_action = self._sample_action_noise(
@@ -1134,17 +1063,10 @@ class RoutedWAM(DreamFastWAM):
             "feature_loss": float(loss_dream.detach()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
             "loss_dream": self.loss_lambda_dream * float(loss_dream.detach().item()),
-            "dream_timestep_mean": (
-                float(timestep_dream.detach().float().mean().item())
-                if timestep_dream is not None
-                else -1.0
-            ),
+            "dream_timestep_mean": float(timestep_dream.detach().float().mean().item()),
         }
         for name, value in dream_parts.items():
-            # Only the loss terms are scaled by lambda_dream; the parent also
-            # returns validity ratios and counts, which must be logged as-is.
-            scale = self.loss_lambda_dream if name.startswith("loss_") else 1.0
-            metrics[name] = scale * float(value.item())
+            metrics[name] = self.loss_lambda_dream * float(value.item())
 
         # --- Interface distillation ---
         if self.distiller is not None:

@@ -1,0 +1,151 @@
+{
+  "all_seed42_step002000": {
+    "successes": 472,
+    "episodes": 500,
+    "per_task_successes": [
+      48,
+      50,
+      46,
+      49,
+      42,
+      49,
+      44,
+      48,
+      48,
+      48
+    ],
+    "ckpt": "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_002000.pt",
+    "raw_summary_csv_consistent": true,
+    "initial_states_complete": true
+  },
+  "all_seed42_step002000_2": {
+    "successes": 471,
+    "episodes": 500,
+    "per_task_successes": [
+      48,
+      50,
+      47,
+      49,
+      42,
+      49,
+      44,
+      48,
+      46,
+      48
+    ],
+    "ckpt": "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_002000.pt",
+    "raw_summary_csv_consistent": true,
+    "initial_states_complete": true
+  },
+  "all_seed42_step004000": {
+    "successes": 457,
+    "episodes": 500,
+    "per_task_successes": [
+      44,
+      50,
+      48,
+      49,
+      36,
+      50,
+      42,
+      45,
+      44,
+      49
+    ],
+    "ckpt": "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_004000.pt",
+    "raw_summary_csv_consistent": true,
+    "initial_states_complete": true
+  },
+  "all_seed42_step004000_2": {
+    "successes": 458,
+    "episodes": 500,
+    "per_task_successes": [
+      44,
+      50,
+      49,
+      49,
+      36,
+      50,
+      42,
+      45,
+      44,
+      49
+    ],
+    "ckpt": "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_004000.pt",
+    "raw_summary_csv_consistent": true,
+    "initial_states_complete": true
+  },
+  "config_differences_vs_first_2000": {
+    "all_seed42_step002000_2": [
+      [
+        ".EVALUATION.output_dir",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step002000",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step002000_2"
+      ],
+      [
+        ".EVALUATION.task_id",
+        6,
+        5
+      ],
+      [
+        ".gpu_id",
+        2,
+        1
+      ]
+    ],
+    "all_seed42_step004000": [
+      [
+        ".EVALUATION.output_dir",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step002000",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step004000"
+      ],
+      [
+        ".EVALUATION.task_id",
+        6,
+        8
+      ],
+      [
+        ".ckpt",
+        "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_002000.pt",
+        "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_004000.pt"
+      ],
+      [
+        ".gpu_id",
+        2,
+        0
+      ]
+    ],
+    "all_seed42_step004000_2": [
+      [
+        ".EVALUATION.output_dir",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step002000",
+        "./evaluate_results/dream_ablation_libero_10/all_seed42_step004000_2"
+      ],
+      [
+        ".EVALUATION.task_id",
+        6,
+        8
+      ],
+      [
+        ".ckpt",
+        "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_002000.pt",
+        "./runs/dream_ablation_libero_10/all_seed42/checkpoints/weights/step_004000.pt"
+      ],
+      [
+        ".gpu_id",
+        2,
+        0
+      ]
+    ]
+  },
+  "training_loss_windows": {
+    "2000": {
+      "loss_action": 0.009115551263093949,
+      "loss_dream": 0.05316139817237854
+    },
+    "4000": {
+      "loss_action": 0.006546673502307385,
+      "loss_dream": 0.04637091509997845
+    }
+  }
+}

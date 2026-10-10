@@ -242,7 +242,7 @@ def plot(aggregate: dict[str, Any], trends: dict[str, list[Optional[float]]], ou
     )
     height = max(3.0, 0.32 * len(aggregate["groups"]) + 1.5)
     fig, (ax_top, ax_bottom) = plt.subplots(
-        2, 1, figsize=(9.0, height + 3.4), height_ratios=[height, 3.2]
+        2, 1, figsize=(9.0, height + 3.4), gridspec_kw={"height_ratios": [height, 3.2]}
     )
 
     image = ax_top.imshow(data, aspect="auto", cmap="magma", vmin=0.0, vmax=1.0)

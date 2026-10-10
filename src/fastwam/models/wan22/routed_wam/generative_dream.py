@@ -58,7 +58,6 @@ class DreamTargetEncoder(nn.Module):
         hidden_dim: int,
         num_tokens: int,
         camera_token_split: Optional[tuple[int, int]],
-        init_scale: float = 1.0,
     ):
         super().__init__()
         self.modality = modality
@@ -72,13 +71,10 @@ class DreamTargetEncoder(nn.Module):
 
         self.proj = nn.Linear(self.feature_dim, self.hidden_dim)
         self.norm = nn.LayerNorm(self.hidden_dim)
-        # `init_scale=0` makes conversion from a pretrained regression model a
-        # no-op, but from scratch it means the Dream tokens carry no information
-        # about the noise realisation at all. Measured: after 416 steps
-        # out_scale had only reached
-        # 0.012 (depth) / 0.018 (dino), and loss_dream never left the
-        # conditional-mean baseline. Default to 1 and set 0 only when resuming.
-        self.out_scale = nn.Parameter(torch.full((1,), float(init_scale)))
+        # Zero-init the output scale so a freshly converted regression model
+        # starts from the parent's pure-query tokens and learns to use the noisy
+        # target, instead of being knocked off its pretrained optimum at step 0.
+        self.out_scale = nn.Parameter(torch.zeros(1))
         self._decoder_ref = [decoder]
 
     def _to_token_layout(self, target: torch.Tensor) -> torch.Tensor:
@@ -212,7 +208,6 @@ class GenerativeDreamExpert(DreamQueryExpert):
                     hidden_dim=self.hidden_dim,
                     num_tokens=int(getattr(self, f"n_{modality}")),
                     camera_token_split=self.camera_token_split,
-                    init_scale=float(generative.get("target_encoder_init_scale", 1.0)),
                 )
                 self.decoder_conditioners[modality] = DreamDecoderConditioner(
                     feature_dim=decoder.feature_dim,

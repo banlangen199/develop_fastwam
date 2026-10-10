@@ -82,7 +82,7 @@ class TinyExpert(nn.Module):
         )
 
 
-def make_dream_expert(generative: bool = False) -> DreamQueryExpert:
+def make_dream_expert(generative: bool = False, image_depth: bool = False) -> DreamQueryExpert:
     expert = DreamQueryExpert(
         text_dim=HIDDEN,
         freq_dim=8,
@@ -112,7 +112,8 @@ def make_dream_expert(generative: bool = False) -> DreamQueryExpert:
             num_heads=HEADS,
             attn_head_dim=HEAD_DIM,
             mlp_ratio=2.0,
-            depth=dict(target_layout="token_feature", target_shape=[8, 3]),
+            depth=(dict(target_layout="image", target_shape=[128, 256], patch_size=4)
+                   if image_depth else dict(target_layout="token_feature", target_shape=[8, 3])),
             dino=dict(target_layout="grid_feature", target_shape=[2, 4, 5]),
         ),
     )
@@ -208,6 +209,7 @@ def make_router(parts, **overrides) -> ImaginationRouter:
         num_dream_tokens=parts["dream_seq_len"],
         group_ids=group_ids,
         group_names=group_names,
+        future_offsets=list(dream_expert.future_offsets),
     )
 
 # --------------------------------------------------------------------- tests
@@ -244,10 +246,11 @@ def test_routing_disabled_is_exactly_the_dense_computation():
         assert torch.equal(expected[name], actual[name]), f"{name} diverged with routing disabled"
 
 
-def test_gate_of_one_reproduces_dense_attention():
+@pytest.mark.parametrize("gate_type", ["bilinear", "va", "da", "static"])
+def test_gate_of_one_reproduces_dense_attention(gate_type):
     parts = make_parts()
     dense = MoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False)
-    router = make_router(parts, mode="learned", debug_force_gate=1.0)
+    router = make_router(parts, mode="learned", debug_force_gate=1.0, gate_type=gate_type)
     routed = RoutedMoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False, router=router)
     dense.eval()
     routed.eval()
@@ -258,9 +261,10 @@ def test_gate_of_one_reproduces_dense_attention():
         torch.testing.assert_close(expected[name], actual[name], rtol=1e-4, atol=1e-4)
 
 
-def test_gate_of_zero_removes_all_dream_evidence():
+@pytest.mark.parametrize("gate_type", ["bilinear", "va", "da", "static"])
+def test_gate_of_zero_removes_all_dream_evidence(gate_type):
     parts = make_parts()
-    router = make_router(parts, mode="learned", debug_force_gate=0.0)
+    router = make_router(parts, mode="learned", debug_force_gate=0.0, gate_type=gate_type)
     routed = RoutedMoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False, router=router)
     routed.eval()
     with torch.no_grad():
@@ -431,19 +435,46 @@ def test_generative_expert_encodes_targets_into_the_dream_layout():
     }
     latent = expert.encode_targets(targets)
     assert latent.shape == (batch, expert.num_dream_tokens, expert.hidden_dim)
-    # Default init_scale is 1: from scratch the branch must actually see its
-    # input. an internal run shows what a 0 init costs -- out_scale
-    # reached only 0.012 after 416 steps and loss_dream never left the
-    # conditional-mean baseline.
-    assert torch.count_nonzero(latent) > 0
+    # 9e37dbb starts a promoted regression expert with pure-query tokens.
+    assert torch.count_nonzero(latent) == 0
+    with torch.no_grad():
+        for encoder in expert.target_encoders.values():
+            encoder.out_scale.fill_(1.0)
+    assert torch.count_nonzero(expert.encode_targets(targets)) > 0
 
-    # init_scale=0 is still available, for converting a pretrained regression
-    # Dream without perturbing it.
-    zeroed = make_dream_expert(generative=False)
-    GenerativeDreamExpert.promote(
-        zeroed, {"enabled": True, "freq_dim": 8, "target_encoder_init_scale": 0.0}
-    )
-    assert torch.count_nonzero(zeroed.encode_targets(targets)) == 0
+
+def test_generative_image_depth_patch_layout_and_gradient():
+    expert = make_dream_expert(generative=True, image_depth=True)
+    encoder = expert.target_encoders["depth"]
+    decoder = expert.decoders["depth"]
+    image = torch.randn(2, 128, 256, requires_grad=True)
+    patches = encoder._to_token_layout(image)
+    assert patches.shape == (2, 2048, 16)
+    torch.testing.assert_close(decoder._unpatchify_image(patches), image)
+    primary_idx, wrist_idx = decoder._two_view_query_indices(device=image.device)
+    two_view = torch.cat([torch.ones(1, 128, 128), -torch.ones(1, 128, 128)], dim=2)
+    view_patches = encoder._to_token_layout(two_view)
+    assert torch.all(view_patches[:, primary_idx] == 1)
+    assert torch.all(view_patches[:, wrist_idx] == -1)
+    with torch.no_grad():
+        encoder.out_scale.fill_(1.0)
+    targets = {"depth": image.reshape(1, 2, 128, 256), "dino": torch.randn(1, 2, 2, 4, 5)}
+    latent = expert.encode_targets(targets)
+    assert latent.shape == (1, expert.num_dream_tokens, expert.hidden_dim)
+    latent.square().mean().backward()
+    assert image.grad is not None and torch.isfinite(image.grad).all()
+    assert torch.count_nonzero(image.grad) > 0
+    with pytest.raises(ValueError, match="image target"):
+        encoder(torch.zeros(1, 128, 128))
+
+
+def test_regression_depth_keeps_nonnegative_output():
+    expert = make_dream_expert(image_depth=True)
+    decoder = expert.decoders["depth"]
+    patches = -torch.ones(1, decoder.num_output_tokens, decoder.feature_dim)
+    assert torch.count_nonzero(decoder._unpatchify_image(patches)) == 0
+    GenerativeDreamExpert.promote(expert, {"enabled": False})
+    assert torch.count_nonzero(decoder._unpatchify_image(patches)) == 0
 
 
 def test_generative_pre_dit_consumes_noisy_latent_and_timestep():
@@ -466,15 +497,107 @@ def test_generative_pre_dit_consumes_noisy_latent_and_timestep():
 
 def test_router_gradients_flow_to_the_gate():
     parts = make_parts()
-    router = make_router(parts, mode="learned", rank=4, lambda_budget=1.0, target_keep_ratio=0.2)
+    router = make_router(parts, mode="learned", rank=4)
     routed = RoutedMoT(mixtures=parts["mixtures"], mot_checkpoint_mixed_attn=False, router=router)
     routed.train()
     out = run_mot(routed, parts)
-    loss = out["action"].pow(2).mean() + router.budget_loss(routed.last_gates)
+    loss = out["action"].pow(2).mean()
     loss.backward()
     grads = [p.grad for p in router.parameters() if p.grad is not None]
     assert grads, "router received no gradient"
     assert any(float(g.abs().sum()) > 0 for g in grads)
+
+
+def _cached_action_inputs(routed, parts):
+    video_len = parts["video_seq_len"]
+    context_len = video_len + parts["dream_seq_len"]
+    with torch.no_grad():
+        video = routed.prefill_video_cache(
+            video_tokens=parts["embeds"]["video"], video_freqs=parts["freqs"]["video"],
+            video_t_mod=parts["t_mod"]["video"], video_context_payload=None,
+            video_attention_mask=parts["mask"][:video_len, :video_len],
+        )
+        dream = routed.forward_dream_with_video_cache(
+            dream_tokens=parts["embeds"]["dream"], dream_freqs=parts["freqs"]["dream"],
+            dream_t_mod=parts["t_mod"]["dream"], dream_context_payload=None,
+            video_kv_cache=video,
+            context_attention_mask=parts["mask"][:context_len, :context_len],
+            video_seq_len=video_len,
+        )
+    return dict(
+        action_tokens=parts["embeds"]["action"], action_freqs=parts["freqs"]["action"],
+        action_t_mod=parts["t_mod"]["action"], action_context_payload=None,
+        context_kv_cache=routed.merge_context_cache(video, dream["dream_kv"]),
+        attention_mask=parts["mask"], video_seq_len=video_len,
+        dream_seq_len=parts["dream_seq_len"],
+    )
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_cached_router_action_loss_trains_every_layer_each_forward(checkpointed):
+    parts = make_parts(generative=True)
+    model = _stub_routed_model(parts)
+    router = make_router(parts, mode="learned", rank=4, warmup_ratio=0.0,
+                         group_granularity="modality_horizon_view", gate_type="va")
+    model.mot.router = router
+    model.mot.mot_checkpoint_mixed_attn = checkpointed
+    parts["mixtures"]["action"].use_gradient_checkpointing = checkpointed
+    model.eval()
+    model.mot.train()  # Matches the trainer: outer model eval, experts train.
+    kwargs = _cached_action_inputs(model.mot, parts)
+    optimizer = torch.optim.SGD(router.parameters(), lr=1.0)
+    for _ in range(2):
+        optimizer.zero_grad()
+        output = model.mot.forward_action_with_context_cache(**kwargs)
+        gates = model.mot.last_group_gates
+        assert len(gates) == LAYERS
+        assert all(g.requires_grad for g in gates)
+        action_loss = output.square().mean()
+        loss, metrics = model._add_router_terms(action_loss, {})
+        assert loss is action_loss  # Statistics add no regularization loss.
+        assert "loss_router_budget" not in metrics
+        assert metrics["router_layers"] == LAYERS
+        assert metrics["router_strength"] == 1.0
+        loss.backward()
+        for name, parameter in router.named_parameters():
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+            assert parameter.grad.abs().sum() > 0, name
+        optimizer.step()
+        assert len(model.mot.last_gates) == LAYERS
+        assert len(model.mot.last_group_gates) == LAYERS
+        assert len(router.last_statistics) == LAYERS
+
+
+@pytest.mark.parametrize("gate_type", ["va", "da", "static"])
+def test_router_warmup_progress_works_when_outer_model_is_eval(gate_type):
+    parts = make_parts(generative=True)
+    model = _stub_routed_model(parts)
+    router = make_router(parts, mode="learned", warmup_ratio=0.1, gate_type=gate_type)
+    model.mot.router = router
+    model.router_config = router.config
+    model.distiller = None
+    model.eval()
+    model.mot.train()
+    kwargs = _cached_action_inputs(model.mot, parts)
+    for step, strength in [(0, 0.0), (5, 0.5), (10, 1.0)]:
+        model.set_training_progress_provider(lambda: (step, 100))
+        model._refresh_progress()
+        assert router.current_strength() == strength
+        model.mot.forward_action_with_context_cache(**kwargs)
+        loss, _ = model._add_router_terms(torch.zeros(()), {})
+        assert loss.item() == 0
+        if step == 0:
+            for gate in model.mot.last_gates:
+                torch.testing.assert_close(gate, torch.ones_like(gate))
+
+
+def test_enabled_learned_router_rejects_missing_group_records():
+    parts = make_parts(generative=True)
+    model = _stub_routed_model(parts)
+    model.mot.router = make_router(parts, mode="learned")
+    with pytest.raises(RuntimeError, match="collected 0 of"):
+        model._add_router_terms(torch.zeros(()), {})
 
 
 def _stub_routed_model(parts):
@@ -572,6 +695,82 @@ def test_generative_dream_loss_masks_invalid_futures():
         prediction, target, future_valid_mask=invalid, modality_valid_masks=None
     )
     assert float(loss_masked) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_dream_time_weights_apply_to_each_sample_before_reduction():
+    model = _stub_routed_model(make_parts(generative=True))
+    for name in ("dyn", "depth", "dino", "sam"):
+        setattr(model, f"loss_lambda_{name}", 1.0)
+    # Errors [1, 9] with weights [0, 2] should give 9, not
+    # mean([1, 9]) * mean([0, 2]) == 5.
+    pred = torch.tensor([1.0, 3.0]).reshape(2, 1, 1).expand(2, 2, 1).clone()
+    pred.requires_grad_()
+    loss, parts = model._generative_dream_loss(
+        {"depth": pred}, {"depth": torch.zeros_like(pred)},
+        future_valid_mask=None, modality_valid_masks=None,
+        sample_weights=torch.tensor([0.0, 2.0]),
+    )
+    assert loss.item() == pytest.approx(9.0)
+    assert parts["loss_depth"].item() == pytest.approx(9.0)
+    loss.backward()
+    assert torch.count_nonzero(pred.grad[0]) == 0
+    assert torch.count_nonzero(pred.grad[1]) == 2
+
+    mask = torch.tensor([[True, True], [True, False]])
+    loss, _ = model._generative_dream_loss(
+        {"depth": pred}, {"depth": torch.zeros_like(pred)},
+        future_valid_mask=None, modality_valid_masks={"depth": mask},
+        sample_weights=torch.tensor([0.0, 2.0]),
+    )
+    assert loss.item() == pytest.approx(6.0)
+    # The scheduler returns a scalar for batch size one.
+    loss, _ = model._generative_dream_loss(
+        {"depth": pred[:1]}, {"depth": torch.zeros_like(pred[:1])},
+        future_valid_mask=None, modality_valid_masks=None,
+        sample_weights=torch.tensor(2.0),
+    )
+    assert loss.item() == pytest.approx(2.0)
+
+
+def test_teacher_rollout_uses_teacher_encoder_time_embedding_and_decoder():
+    from unittest.mock import patch
+
+    parts = make_parts(generative=True)
+    model = _stub_routed_model(parts)
+    distiller = InterfaceDistiller(
+        config=InterfaceDistillConfig(enabled=True),
+        dream_expert=model.dream_expert, num_layers=LAYERS,
+    )
+    video_len = parts["video_seq_len"]
+    context_len = video_len + parts["dream_seq_len"]
+    with torch.no_grad():
+        video_kv = model.mot.prefill_video_cache(
+            video_tokens=parts["embeds"]["video"],
+            video_freqs=parts["freqs"]["video"],
+            video_t_mod=parts["t_mod"]["video"],
+            video_context_payload=None,
+            video_attention_mask=parts["mask"][:video_len, :video_len],
+        )
+        initial = model._dream_noise_like_targets(
+            batch_size=parts["batch"], device=torch.device("cpu"), dtype=torch.float32
+        )
+        # A teacher rollout must never invoke any of the student's outer layers.
+        with (
+            patch.object(model.dream_expert, "encode_targets", side_effect=AssertionError("student encoder")),
+            patch.object(model.dream_expert, "pre_dit", side_effect=AssertionError("student timestep")),
+            patch.object(model.dream_expert, "post_dit", side_effect=AssertionError("student decoder")),
+            distiller.use_teacher_dream(model.mot),
+        ):
+            out = model._run_dream_rollout(
+                num_steps=2, scheduler=model.infer_dream_scheduler,
+                initial_targets=initial, context=None, context_mask=None,
+                video_kv_cache=video_kv,
+                context_attention_mask=parts["mask"][:context_len, :context_len],
+                video_seq_len=video_len, batch_size=parts["batch"],
+                device=torch.device("cpu"), dtype=torch.float32,
+            )
+        assert torch.isfinite(out["targets"]["depth"]).all()
+        assert model.mot.mixtures["dream"] is model.dream_expert
 
 
 def test_camera_grouping_matches_the_decoder_two_view_layout():
@@ -708,6 +907,123 @@ def test_cached_path_does_not_leak_gates_between_forwards():
     assert len(routed.last_gates) == first == LAYERS
 
 
+def test_pr2_router_gates_individual_dream_keys_within_a_camera_group():
+    parts = make_parts()
+    router = make_router(parts, mode="learned", rank=4, warmup_ratio=0.0,
+                         group_granularity="modality_horizon_camera")
+    assert router.config.gate_type == "bilinear"
+    assert router.group_mapping[1]["view"] == "wrist"
+    assert router.group_mapping[1]["future_offset"] == 0
+    assert set(router.state_dict()) == {
+        "layer_bias", "group_bias",
+        *{f"{projection}.{layer}.weight" for projection in ("query_proj", "key_proj")
+          for layer in range(LAYERS)},
+    }
+    with torch.no_grad():
+        router.layer_bias.zero_()
+        router.group_bias.zero_()
+        router.query_proj[0].weight.fill_(0.25)
+        router.key_proj[0].weight.fill_(0.25)
+    keys = torch.zeros(2, parts["dream_seq_len"], INNER)
+    inputs = dict(layer_idx=0, q_action=torch.ones(2, ACTION_TOKENS, INNER))
+    initial = router.gate_for_layer(**inputs, k_dream=keys)["gate"]
+    keys[:, 1] = 1.0
+    changed = router.gate_for_layer(**inputs, k_dream=keys)["gate"]
+    assert router.group_ids[0] == router.group_ids[1]
+    assert torch.all(changed[:, 1] > initial[:, 1])
+    torch.testing.assert_close(changed[:, 0], initial[:, 0], rtol=0, atol=0)
+    torch.testing.assert_close(changed[:, 2:], initial[:, 2:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_pr2_router_checkpointing_preserves_outputs_gradients_and_gate_records(cached):
+    results = []
+    for checkpointed in (False, True):
+        parts = make_parts()
+        router = make_router(parts, mode="learned", rank=4, warmup_ratio=0.0,
+                             lambda_budget=0.01, group_granularity="modality_horizon_camera")
+        parts["mixtures"]["action"].use_gradient_checkpointing = checkpointed
+        routed = RoutedMoT(mixtures=parts["mixtures"],
+                           mot_checkpoint_mixed_attn=checkpointed, router=router).train()
+        if cached:
+            output = routed.forward_action_with_context_cache(**_cached_action_inputs(routed, parts))
+        else:
+            output = run_mot(routed, parts)["action"]
+        budget = router.budget_loss(routed.last_gates)
+        assert budget.requires_grad and budget.detach() > 0
+        (output.square().mean() + budget).backward()
+        assert len(routed.last_gates) == len(routed.last_group_gates) == LAYERS
+        assert len(router.last_statistics) == LAYERS
+        gradients = {}
+        for name, parameter in router.named_parameters():
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+            assert parameter.grad.abs().sum() > 0, name
+            gradients[name] = parameter.grad.clone()
+        results.append((output.detach(), gradients))
+    torch.testing.assert_close(results[0][0], results[1][0])
+    for name, gradient in results[0][1].items():
+        torch.testing.assert_close(gradient, results[1][1][name])
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_pr2_router_trains_with_precomputed_targets_and_regression_dream(checkpointed):
+    from fastwam.models.wan22.action_dit import ActionDiT
+
+    torch.manual_seed(11)
+    common = dict(hidden_dim=HIDDEN, ffn_dim=FFN, text_dim=HIDDEN, freq_dim=8,
+                  eps=1e-6, num_heads=HEADS, attn_head_dim=HEAD_DIM, num_layers=LAYERS)
+    video = WanVideoDiT(**common, in_dim=4, out_dim=4, patch_size=(1, 2, 2),
+                       has_image_input=False, seperated_timestep=True,
+                       video_attention_mask_mode="first_frame_causal")
+    action = ActionDiT(**common, action_dim=7, use_gradient_checkpointing=checkpointed)
+    dream = DreamQueryExpert(
+        **common,
+        dream_query=dict(modalities=["depth", "dino"], future_offsets=[16, 32],
+                         camera_token_split=[2, 2], n_depth=4, n_dino=4),
+        dream_decoder=dict(
+            decoder_dim=HIDDEN, decoder_ffn_dim=FFN, num_layers=1, num_heads=HEADS,
+            depth=dict(target_layout="image", target_shape=[4, 8], patch_size=2),
+            dino=dict(target_layout="grid_feature", target_shape=[2, 4, 5]),
+        ),
+    )
+    mot = MoT(dict(video=video, dream=dream, action=action),
+              mot_checkpoint_mixed_attn=checkpointed)
+    dense = DreamFastWAM(video_expert=video, action_expert=action, dream_expert=dream,
+                         mot=mot, vae=nn.Identity(), text_dim=HIDDEN, proprio_dim=None,
+                         loss_lambda_video=0, device="cpu", torch_dtype=torch.float32)
+    model = RoutedWAM.from_dense_model(
+        dense, generative_dream={"enabled": False}, training_mode="dense_joint",
+        router=dict(mode="learned", rank=4, lambda_budget=0.01, warmup_ratio=0.0,
+                    group_granularity="modality_horizon_camera"),
+    )
+    router = model.mot.router
+    model.configure_trainable_parameters(freeze_video_expert=True)
+    assert not hasattr(model, "online_targets")
+    assert model.train_dream_scheduler is None
+    # Stub only the data/VAE boundary: cached targets and real tiny experts
+    # exercise the complete Dream + Action + router training objective.
+    latent = torch.randn(2, 4, 1, 4, 4)
+    sample = dict(
+        context=torch.randn(2, 3, HIDDEN), context_mask=torch.ones(2, 3, dtype=torch.bool),
+        input_latents=latent, first_frame_latents=latent, fuse_vae_embedding_in_latents=True,
+        action=torch.randn(2, ACTION_TOKENS, 7),
+        action_is_pad=torch.zeros(2, ACTION_TOKENS, dtype=torch.bool),
+        dream_targets={"depth": torch.rand(2, 2, 4, 8) + 0.1,
+                       "dino": torch.randn(2, 2, 2, 4, 5)},
+    )
+    model.build_inputs = lambda sample, **_: sample
+    loss, metrics = model.training_loss(sample)
+    assert metrics["loss_router_budget"] > 0
+    assert loss.detach().item() == pytest.approx(
+        metrics["loss_action"] + metrics["loss_dream"] + metrics["loss_router_budget"], rel=1e-5
+    )
+    loss.backward()
+    for name, parameter in router.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+
+
 def test_task_configs_compose_and_select_the_routed_factory():
     pytest.importorskip("hydra")
     from hydra import compose, initialize_config_dir
@@ -718,24 +1034,56 @@ def test_task_configs_compose_and_select_the_routed_factory():
     register_default_resolvers()
     config_dir = str(Path(__file__).resolve().parents[1] / "configs")
     expected = {
+        "routed_wam_libero_10": False,
         "routed_wam_libero_goal": False,
         "routed_wam_libero_goal_distill": True,
         "routed_wam_libero_4suite": False,
+        "routed_wam_libero_4suite_distill": True,
+        "routed_wam_libero_4suite_full": False,
     }
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         for task, distill_enabled in expected.items():
             cfg = compose(config_name="train", overrides=[f"task={task}"])
             model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
             assert model_cfg["_target_"] == "fastwam.routed_runtime.create_routed_wam"
-            # Regression Dream by default: flow matching in target space is not
-            # well posed through the 57x Dream bottleneck (measured, E1-E6).
-            assert model_cfg["generative_dream"]["enabled"] is False
-            assert float(model_cfg["generative_dream"]["target_encoder_init_scale"]) == 1.0
-            assert model_cfg["online_dream_targets"]["enabled"] is True
+            assert model_cfg["generative_dream"]["enabled"] is distill_enabled
+            assert model_cfg["training_mode"] == ("joint" if distill_enabled else "dense_joint")
+            assert "online_dream_targets" not in model_cfg
+            assert cfg.data.train.dream_target.enabled is True
+            assert model_cfg["dream_query_config"]["dream_decoder"]["depth"]["target_layout"] == "image"
+            assert model_cfg["router"]["gate_type"] == "bilinear"
+            assert model_cfg["router"]["group_granularity"] == "modality_horizon_camera"
+            assert model_cfg["router"]["lambda_budget"] == 0.01
             assert model_cfg["interface_distill"]["enabled"] is distill_enabled
             # The split path cannot denoise future video frames.
             assert float(model_cfg["loss"]["lambda_video"]) == 0.0
             assert bool(cfg.freeze_video_expert) is True
+
+
+def test_old_routed_weights_can_warm_start_local_decoder_but_other_keys_stay_strict(tmp_path):
+    model = _stub_routed_model(make_parts(generative=True))
+    model.proprio_encoder = None
+    prefix = "mixtures.dream.decoder_conditioners."
+    state = {key: value for key, value in model.mot.state_dict().items() if not key.startswith(prefix)}
+    checkpoint = tmp_path / "old_routed.pt"
+    torch.save({"mot": state}, checkpoint)
+    report = model.verify_checkpoint_compatibility(checkpoint)
+    assert report["missing_new_parameters"]
+    assert all(key.startswith(prefix) for key in report["missing_new_parameters"])
+    model.load_checkpoint(checkpoint, strict_shapes=True)
+    # New checkpoints include and exactly restore every local decoder weight.
+    full_state = {key: value.clone() for key, value in model.mot.state_dict().items()}
+    torch.save({"mot": full_state}, checkpoint)
+    with torch.no_grad():
+        for param in model.dream_expert.decoder_conditioners.parameters():
+            param.zero_()
+    model.load_checkpoint(checkpoint, strict_shapes=True)
+    for key, value in model.mot.state_dict().items():
+        torch.testing.assert_close(value, full_state[key])
+    del state["mixtures.dream.decoders.depth.output_proj.weight"]
+    torch.save({"mot": state}, checkpoint)
+    with pytest.raises(RuntimeError, match="missing_pretrained"):
+        model.verify_checkpoint_compatibility(checkpoint)
 
 
 def test_interface_convergence_measures_both_drifts():
@@ -823,7 +1171,7 @@ def test_every_model_config_key_is_accepted_by_the_factory():
     # And the routed-only keys must be named on the routed factory specifically,
     # not swallowed by **kwargs and passed down to the dense one.
     for key in ("router", "interface_distill", "generative_dream",
-                "dream_scheduler", "online_dream_targets", "finetune_action_only"):
+                "dream_scheduler", "finetune_action_only"):
         assert key in routed_params, f"{key} must be an explicit create_routed_wam parameter"
 
 

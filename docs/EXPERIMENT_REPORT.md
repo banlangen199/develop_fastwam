@@ -287,6 +287,10 @@ bash scripts/train_routed_zero1.sh 8 task=routed_wam_libero_goal \
 bash scripts/train_routed_zero1.sh 8 task=routed_wam_libero_goal_distill \
   resume=runs/routed_wam_libero_goal/<run_id>/checkpoints/weights/step_XXXXXX.pt
 
+# ---- 训练：四 suite 阶段 2（同一蒸馏配方，使用对应阶段 1 权重）----
+bash scripts/train_routed_zero1.sh 8 task=routed_wam_libero_4suite_distill \
+  resume=runs/routed_wam_libero_4suite/<run_id>/checkpoints/weights/step_XXXXXX.pt
+
 # ---- 评测：LIBERO ----
 # 评测 sweep 启动器是站点相关的（work-stealing 槽位池 + 断点续跑），不随本仓提供；
 # 任何满足 TASK_CONFIG / CKPT / DATASET_STATS / OUTPUT_DIR / NUM_GPUS /

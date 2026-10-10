@@ -4,40 +4,12 @@ defaults:
 
 _target_: fastwam.routed_runtime.create_routed_wam
 
-# ------------------------------------------------- depth target layout
-# `online_dream_targets` (below) patchifies depth on device with patch_size 8,
-# giving 512 tokens of 64 dims -- two 16x16 camera grids, which is what the
-# decoder's two-view token_feature path expects. The inherited dream_fastwam
-# default keeps depth as a [128, 256] image and patchifies inside the decoder
-# instead; both are valid, but the online extractor emits the token form, so
-# RoutedWAM pins it here rather than changing the shared default.
-#
-# lambda_depth is raised with it: the robust (median / 10-90 spread)
-# normalisation the online extractor applies shrinks the residual, so the
-# per-modality weight has to grow to keep depth's gradient share comparable.
-dream_query_config:
-  dream_decoder:
-    depth:
-      target_layout: token_feature
-      patch_size: 8
-      target_shape: [512, 64]
-
-loss:
-  lambda_depth: 10.0
-
 # ---------------------------------------------------------------- generative
-# The Dream expert denoises its multi-modal targets instead of regressing them.
-# With `enabled: false` the model is behaviourally identical to dream_fastwam.
-# Regression Dream by default. The generative variant is left in place but off:
-# flow matching in target space is not well posed through a 57x bottleneck (see
-# routed_wam/model.py), and jobs E1-E6 measured loss_dream stuck at the
-# conditional-mean baseline (~1.21) with it enabled.
+# Dream directly regresses future targets in one forward, without Dream noise.
+# Generative Dream remains available only for explicitly selected legacy tasks.
 generative_dream:
   enabled: false
   freq_dim: 256
-  # 0.0 only when converting a pretrained regression Dream; from scratch that
-  # starves the branch of its own input.
-  target_encoder_init_scale: 1.0
 
 # Used only when generative_dream.enabled=true; unused by direct regression.
 dream_scheduler:
@@ -47,15 +19,14 @@ dream_scheduler:
   inference_steps: 1
 
 # ------------------------------------------------------------------- router
-# Learned priors: va = Video + Action, da = Dream + Action, static = learned constants.
-# The existing shared mixed softmax receives +log(gate) on Dream columns only.
 router:
   mode: learned
   routing_mode: null
-  gate_type: va              # va | da | static; mode=none disables these priors.
-  group_granularity: modality_horizon_view
+  gate_type: bilinear  # PR #2: Action-query / Dream-key token gates.
   rank: 64
   temperature: 1.0
+  # sigmoid(4) ~ 0.982, so routing starts as a near-identity and has to learn
+  # what to switch off rather than what to switch on.
   bias_init: 4.0
   # Buckets used for the budget bias, the training-log breakdown and the
   # stage-dependent-perception figure. `_camera` splits each block into its
@@ -70,13 +41,16 @@ router:
   lambda_budget: 0.01
   gate_threshold: 1.0e-3
   hard_prune_at_inference: true
-  min_keep_tokens: 0
+  warmup_ratio: 0.1
   log_statistics: true
-  # Compatibility settings for explicitly selected full/static/dynamic QK tasks.
+  debug_force_gate: null
+  layers: null
+  # Explicit compatibility settings for the earlier QK-routing ablations.
   router_enabled: true
   router_warmup_steps: 0
   router_hidden_dim: 128
-  router_gate_loss_weight: 0.0  # Router learns from Action loss without an information cost.
+  router_gate_loss_weight: 0.0
+
 
 # -------------------------------------------------------- interface distill
 # Compress the multi-step Dream rollout into one forward, supervising the
@@ -94,27 +68,6 @@ interface_distill:
   route_aware: true
   warmup_ratio: 0.1
   detach_teacher: true
-
-# ------------------------------------------------- online dream targets
-# The configured future_offsets (16, 32) are multiples of
-# action_video_freq_ratio (4), so they land on video_sample_indices
-# [0,4,...,32] -- the future frames are already in every batch. Extracting the
-# targets on device costs ~82 ms/step (measured, batch 32, 2 offsets x 2
-# cameras) and needs no `extras/` on disk at all: with this enabled,
-# data.train.dream_target.enabled can stay false.
-#
-# Precomputing the same targets is ~44 GB per LIBERO suite and ~48 MB of FUSE
-# bucket reads per step, and has to be regenerated whenever future_offsets or
-# modalities change.
-online_dream_targets:
-  enabled: true
-  modalities: [dino, depth]
-  dino_model: ./checkpoints/extractors/dinov2-base
-  depth_model: ./checkpoints/extractors/depth-anything-v2-small
-  dino_input: 224
-  depth_input: 224
-  # sample["video"] is fed to the Wan VAE, so it is in [-1, 1].
-  video_range: tanh
 
 finetune_action_only: false
 training_mode: dense_joint

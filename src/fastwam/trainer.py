@@ -856,13 +856,14 @@ class Wan22Trainer:
                 profile_micro_steps += 1
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
-
                 if profiling:
                     profile_sync()
                     stage_start = time.perf_counter()
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    # FastWAM.forward delegates to training_loss. Go through the
+                    # prepared wrapper so DeepSpeed registers its backward and
+                    # accumulation-scaling hooks (and DDP prepares its reducer).
+                    loss, loss_dict = self.model(sample)
                 if profiling:
                     profile_sync()
                     profile_times["forward"] += time.perf_counter() - stage_start

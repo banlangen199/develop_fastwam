@@ -27,7 +27,7 @@ freeze_video_expert: true
 
 model:
   mot_checkpoint_mixed_attn: true
-  # Freeze pretrained Video; jointly train Dream, Action and the group Router.
+  # Freeze pretrained Video; jointly train Dream, Action and the PR #2 Router.
   training_mode: dense_joint
   finetune_action_only: false
   generative_dream:
@@ -35,7 +35,7 @@ model:
   router:
     mode: learned
     routing_mode: null
-    lambda_budget: 0.0
+    lambda_budget: 0.01
   interface_distill:
     enabled: false
   loss:

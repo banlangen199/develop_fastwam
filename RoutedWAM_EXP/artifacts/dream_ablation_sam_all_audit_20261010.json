@@ -1,0 +1,644 @@
+{
+  "date": "2026-10-10",
+  "evaluations": {
+    "none_seed42_step004000": {
+      "source": "evaluate_results/dream_ablation_libero_10/none_seed42_step004000",
+      "total_episodes": 500,
+      "successes": 470,
+      "success_rate_percent": 94.0,
+      "task_successes": [
+        45,
+        50,
+        46,
+        49,
+        43,
+        50,
+        45,
+        50,
+        45,
+        47
+      ],
+      "task_failure_ids": {
+        "0": [
+          16,
+          28,
+          39,
+          41,
+          49
+        ],
+        "1": [],
+        "2": [
+          0,
+          6,
+          14,
+          48
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          7,
+          18,
+          19,
+          23,
+          28,
+          32,
+          37
+        ],
+        "5": [],
+        "6": [
+          12,
+          14,
+          22,
+          27,
+          38
+        ],
+        "7": [],
+        "8": [
+          6,
+          20,
+          24,
+          30,
+          35
+        ],
+        "9": [
+          16,
+          20,
+          47
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 0,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/none_seed42_step004000",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/none_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/none_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [],
+      "routing_eval": null
+    },
+    "none_seed42_step004000_2": {
+      "source": "evaluate_results/dream_ablation_libero_10/none_seed42_step004000_2",
+      "total_episodes": 500,
+      "successes": 470,
+      "success_rate_percent": 94.0,
+      "task_successes": [
+        45,
+        50,
+        46,
+        49,
+        43,
+        50,
+        45,
+        50,
+        45,
+        47
+      ],
+      "task_failure_ids": {
+        "0": [
+          16,
+          28,
+          39,
+          41,
+          49
+        ],
+        "1": [],
+        "2": [
+          0,
+          14,
+          47,
+          48
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          7,
+          18,
+          19,
+          23,
+          28,
+          32,
+          37
+        ],
+        "5": [],
+        "6": [
+          12,
+          14,
+          22,
+          27,
+          38
+        ],
+        "7": [],
+        "8": [
+          16,
+          24,
+          30,
+          40,
+          47
+        ],
+        "9": [
+          16,
+          20,
+          47
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 8,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/none_seed42_step004000_2",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/none_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/none_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [],
+      "routing_eval": null
+    },
+    "sam_seed42_step004000": {
+      "source": "evaluate_results/dream_ablation_libero_10/sam_seed42_step004000",
+      "total_episodes": 500,
+      "successes": 475,
+      "success_rate_percent": 95.0,
+      "task_successes": [
+        49,
+        50,
+        49,
+        49,
+        42,
+        50,
+        43,
+        49,
+        47,
+        47
+      ],
+      "task_failure_ids": {
+        "0": [
+          49
+        ],
+        "1": [],
+        "2": [
+          41
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          4,
+          7,
+          18,
+          21,
+          32,
+          37,
+          41,
+          47
+        ],
+        "5": [],
+        "6": [
+          1,
+          10,
+          19,
+          21,
+          22,
+          25,
+          27
+        ],
+        "7": [
+          20
+        ],
+        "8": [
+          5,
+          7,
+          30
+        ],
+        "9": [
+          16,
+          25,
+          36
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 8,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/sam_seed42_step004000",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/sam_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/sam_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [
+        "sam"
+      ],
+      "routing_eval": null
+    },
+    "sam_seed42_step004000_2": {
+      "source": "evaluate_results/dream_ablation_libero_10/sam_seed42_step004000_2",
+      "total_episodes": 500,
+      "successes": 474,
+      "success_rate_percent": 94.8,
+      "task_successes": [
+        49,
+        50,
+        48,
+        49,
+        42,
+        50,
+        43,
+        49,
+        47,
+        47
+      ],
+      "task_failure_ids": {
+        "0": [
+          49
+        ],
+        "1": [],
+        "2": [
+          12,
+          14
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          4,
+          7,
+          18,
+          21,
+          32,
+          37,
+          41,
+          47
+        ],
+        "5": [],
+        "6": [
+          1,
+          10,
+          19,
+          21,
+          22,
+          25,
+          27
+        ],
+        "7": [
+          20
+        ],
+        "8": [
+          5,
+          28,
+          30
+        ],
+        "9": [
+          16,
+          25,
+          36
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 8,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/sam_seed42_step004000_2",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/sam_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/sam_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [
+        "sam"
+      ],
+      "routing_eval": null
+    },
+    "all_seed42_step004000": {
+      "source": "evaluate_results/dream_ablation_libero_10/all_seed42_step004000",
+      "total_episodes": 500,
+      "successes": 457,
+      "success_rate_percent": 91.4,
+      "task_successes": [
+        44,
+        50,
+        48,
+        49,
+        36,
+        50,
+        42,
+        45,
+        44,
+        49
+      ],
+      "task_failure_ids": {
+        "0": [
+          1,
+          18,
+          26,
+          28,
+          39,
+          49
+        ],
+        "1": [],
+        "2": [
+          5,
+          14
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          4,
+          7,
+          11,
+          18,
+          19,
+          23,
+          26,
+          27,
+          32,
+          33,
+          37,
+          41,
+          44,
+          47
+        ],
+        "5": [],
+        "6": [
+          10,
+          12,
+          14,
+          21,
+          22,
+          27,
+          29,
+          38
+        ],
+        "7": [
+          4,
+          5,
+          20,
+          26,
+          36
+        ],
+        "8": [
+          2,
+          7,
+          24,
+          30,
+          32,
+          35
+        ],
+        "9": [
+          5
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 8,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/all_seed42_step004000",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/all_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/all_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [
+        "dyn",
+        "depth",
+        "dino",
+        "sam"
+      ],
+      "routing_eval": null
+    },
+    "all_seed42_step004000_2": {
+      "source": "evaluate_results/dream_ablation_libero_10/all_seed42_step004000_2",
+      "total_episodes": 500,
+      "successes": 458,
+      "success_rate_percent": 91.6,
+      "task_successes": [
+        44,
+        50,
+        49,
+        49,
+        36,
+        50,
+        42,
+        45,
+        44,
+        49
+      ],
+      "task_failure_ids": {
+        "0": [
+          1,
+          18,
+          26,
+          28,
+          39,
+          49
+        ],
+        "1": [],
+        "2": [
+          48
+        ],
+        "3": [
+          13
+        ],
+        "4": [
+          4,
+          7,
+          11,
+          18,
+          19,
+          23,
+          26,
+          27,
+          32,
+          33,
+          37,
+          41,
+          44,
+          47
+        ],
+        "5": [],
+        "6": [
+          10,
+          12,
+          14,
+          21,
+          22,
+          27,
+          29,
+          38
+        ],
+        "7": [
+          4,
+          5,
+          20,
+          26,
+          36
+        ],
+        "8": [
+          3,
+          5,
+          7,
+          21,
+          26,
+          30
+        ],
+        "9": [
+          5
+        ]
+      },
+      "seed": 42,
+      "evaluation": {
+        "task_suite_name": "libero_10",
+        "task_id": 8,
+        "num_trials": 50,
+        "output_dir": "./evaluate_results/dream_ablation_libero_10/all_seed42_step004000_2",
+        "env_num": 1,
+        "num_steps_wait": 30,
+        "replan_steps": 10,
+        "binarize_gripper": true,
+        "use_action_ensembler": false,
+        "visualize_future_video": false,
+        "action_horizon": null,
+        "num_inference_steps": 10,
+        "sigma_shift": null,
+        "text_cfg_scale": 1.0,
+        "negative_prompt": "",
+        "rand_device": "cpu",
+        "tiled": false,
+        "dataset_stats_path": "./runs/dream_ablation_libero_10/all_seed42/dataset_stats.json",
+        "use_training_config": true,
+        "training_config_path": "./runs/dream_ablation_libero_10/all_seed42/config.yaml",
+        "device": "cuda"
+      },
+      "active_dream_modalities": [
+        "dyn",
+        "depth",
+        "dino",
+        "sam"
+      ],
+      "routing_eval": null
+    }
+  },
+  "training_last100": {
+    "sam": {
+      "action_loss": 0.006316324053332209,
+      "loss_dream": 0.00520719722378999,
+      "loss_dyn": 0.0,
+      "loss_depth": 0.0,
+      "loss_dino": 0.0,
+      "loss_sam": 0.005207197153940797,
+      "grad_norm": 0.0988190832734108
+    },
+    "all": {
+      "action_loss": 0.006546673502307385,
+      "loss_dream": 0.04637091509997845,
+      "loss_dyn": 0.012272528540343046,
+      "loss_depth": 0.009717135652899743,
+      "loss_dino": 0.01904294081032276,
+      "loss_sam": 0.005338309053331614,
+      "grad_norm": 0.10528318472206592
+    }
+  },
+  "checkpoint_metadata": {
+    "sam": {
+      "step": 4000,
+      "mot_tensors": 2633
+    },
+    "all": {
+      "step": 4000,
+      "mot_tensors": 2633
+    }
+  },
+  "notes": [
+    "All four new evaluations contain ten complete tasks with initial states 0..49. Summary JSON and per-task CSV were checked against raw task JSON.",
+    "All 20 all task logs and all 10 sam second-run task logs record the correct checkpoint/stats and zero missing/unexpected checkpoint keys.",
+    "sam first-run task0/task1 logs were overwritten by a later 05:58 OOM attempt; retained successful result JSON starts at 05:17 and videos exist. Do not interpret current logs as clean successful logs for those two tasks.",
+    "All all-run tracebacks occur after task completion in EGL context destructors.",
+    "all and sam train configs differ only in active modalities, loss coefficients, output directory and W&B name. Evaluation data and inference settings match.",
+    "all/sam/none min/max normalization statistics are identical; other numeric differences are small and unused by the active normalization/correlated-noise settings.",
+    "all and sam each have 4000 sequential finite metric records and final trainer global_step 4000. No simulator reevaluation or training was launched in this audit.",
+    "Auxiliary loss magnitude is not a gradient measurement; gradient conflict or harmful modality attribution is unproven.",
+    "Current CPU regression tests: 72 passed (test_dream_ablation.py, test_dense_router_experiment.py, test_dynamic_feature_router.py). Historical code equivalence cannot be established from these tests alone."
+  ],
+  "video_samples": [
+    "evaluate_results/dream_ablation_libero_10/all_seed42_step004000/libero_10/videos/2026_10_10-07_15_44--episode=task4_trial11--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4",
+    "evaluate_results/dream_ablation_libero_10/all_seed42_step004000/libero_10/videos/2026_10_10-07_15_44--episode=task4_trial19--success=False--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4",
+    "evaluate_results/dream_ablation_libero_10/sam_seed42_step004000/libero_10/videos/2026_10_10-05_13_18--episode=task4_trial11--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4",
+    "evaluate_results/dream_ablation_libero_10/sam_seed42_step004000/libero_10/videos/2026_10_10-05_13_18--episode=task4_trial19--success=True--task=put_the_white_mug_on_the_left_plate_and_put_the_ye.mp4"
+  ]
+}

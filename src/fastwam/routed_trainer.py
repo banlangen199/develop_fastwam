@@ -16,8 +16,11 @@ and keeps working after the job ages out of the cluster's own TensorBoard window
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
+
+import torch
 
 from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger

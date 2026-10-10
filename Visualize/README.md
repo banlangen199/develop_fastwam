@@ -2,7 +2,7 @@
 
 `Visualize/` 中的工具分为两类：
 
-- **在线预测可视化**：运行一个 LIBERO episode，保存 DreamFastWAM 在推理时预测的未来模态，再统一渲染。
+- **在线预测可视化**：运行一个 LIBERO episode，保存 DreamFastWAM / RoutedWAM 在推理时预测的未来模态，再统一渲染。
 - **离线数据可视化**：读取 LeRobot 数据集已有的 RGB 和 extras，查看监督目标或生成点云。
 
 所有命令均应在仓库根目录运行：
@@ -30,13 +30,51 @@ conda activate fastwam
 
 该脚本只运行指定任务的一个初始状态，不会遍历整个测试集。每次重新规划时：
 
-1. 正常预测一段 action；
-2. 只在该 action chunk 的第一次 denoising 前向中解码 Dream；
+1. 在 Action 去噪前计算 Video / Dream，缓存逐层 K/V；
+2. DreamFastWAM 做一次回归前向；生成式 RoutedWAM 执行配置指定步数的 Dream 去噪，随后 Action 多步去噪复用 K/V；
 3. 将原始预测先保存到 CPU；
 4. episode 完成后统一拟合颜色映射并生成可视化。
 
-这样不会在每个 denoising step 重复运行 Dream decoder，也不会在 rollout
-过程中逐帧进行 PCA、KMeans 和视频编码。
+这样不会在每个 Action denoising step 重复运行 Dream decoder。生成式
+RoutedWAM 的每个 Dream 去噪步仍需运行 decoder 预测速度，保存和渲染的是
+最后一次 scheduler 更新后的目标空间预测，而不是速度、K/V 或真实未来标签。
+PCA、KMeans 和视频编码统一在 episode 完成后执行。
+
+### RoutedWAM 推理可视化
+
+同一个入口支持 RoutedWAM，无需单独脚本。默认从 checkpoint 附近的训练
+`config.yaml` 恢复模型类型和 Dream 步数，第一阶段、蒸馏阶段权重均可使用：
+
+```bash
+python Visualize/infer_dream_episode.py \
+  ckpt=/path/to/routed_wam/checkpoints/weights/step_XXXXXX.pt \
+  EVALUATION.task_suite_name=libero_goal \
+  EVALUATION.task_id=0 \
+  EVALUATION.initial_state_index=0 \
+  EVALUATION.dream_inference_steps=1 \
+  EVALUATION.num_inference_steps=10 \
+  EVALUATION.output_dir=./evaluate_results/routed_dream/steps1
+```
+
+`EVALUATION.dream_inference_steps=8` 可改为 8 步 Dream 去噪；
+`EVALUATION.num_inference_steps` 独立控制 Action。省略 Dream 参数或设为
+`null` 会保留训练配置中的值。该覆盖在恢复训练配置之后应用，避免被覆盖掉；
+不要用 `model.dream_scheduler.inference_steps` 代替它。
+普通回归 Dream 不接受 Dream 去噪步数覆盖。
+
+输出格式与原脚本一致：`raw_predictions/replan_*.pt` 保存所有 horizon 的
+depth、dyn、DINO、SAM（以模型实际启用的模态为准），`rendered/` 保存双视角
+PNG 和 MP4。record 的 `metadata` 和 `episode_manifest.json` 额外记录模型类、
+Dream 预测方式、Dream 和 Action 的实际推理步数。回归 Dream 的去噪步数为 `null`。
+这里展示的是最终多模态预测，不包含每个 Dream 去噪中间步或路由热力图。
+
+检查预测本身的空间结构时，可加 `VISUALIZATION.overlay_alpha=1.0` 去掉
+RGB 叠加，并用 `VISUALIZATION.sam_render_mode=pca` 查看 SAM 特征 PCA。
+默认 `regions` 只是 SAM embedding 的 KMeans 聚类，不是 SAM mask decoder
+输出的分割结果；即使特征是噪声，聚类也会分配彩色区域。
+回归 Dream 的 dyn 经 sigmoid 显示；生成式 Dream 的最终 dyn 样本直接按
+`[0,1]` 截断显示，不重复 sigmoid。原始 `.pt` 数值保持不变。
+depth 中非正值显示为黑色。可视化不能保证生成预测具有正确的几何或语义。
 
 ### 基本命令
 
@@ -448,3 +486,76 @@ OpenCV 是否带视频编码支持；点云脚本的彩色输出还要求系统�
 Dream episode 渲染已经对整个 episode 使用统一的 depth 范围、DINO PCA
 和 SAM KMeans。自行调用底层接口时也应复用同一个 projection，而不是每帧
 重新拟合。
+
+## Router 阶段特征可视化：rollout 上排，gate 下排
+
+使用训练过新 16-group Router 的 checkpoint，运行一个 LIBERO episode：
+
+```bash
+conda activate fastwam
+CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH=src:. \
+python Visualize/eval_router_episode.py \
+  ckpt=/path/to/new_router_checkpoint.pt \
+  EVALUATION.task_suite_name=libero_10 \
+  EVALUATION.task_id=0 \
+  EVALUATION.initial_state_index=0 \
+  EVALUATION.num_inference_steps=10 \
+  EVALUATION.output_dir=./evaluate_results/router_demo
+```
+
+自动读取 checkpoint 附近的训练配置和 dataset stats，保留其 Dream 去噪步数。
+`EVALUATION.dream_inference_steps=8` 可显式覆盖 Dream 步数。
+旧版 `router.mode=none` 且没有 `routing_mode` 的 checkpoint 没有这些 gates，
+新脚本会明确报错，不会为演示生成虚构 gate。请使用新 Router 训练的权重。
+
+每列对应一次 replan：上方是真实观测（默认主相机），下方是 DINO、CoTracker、
+SAM、Depth 四种模态的霓虹色条和原始数值。每种模态对两路相机、两个未来时刻的
+四个 group gates 直接取平均。所有 replan 共用固定 `[-1,1]` QK 缩放尺度（负值条向左、正值条向右），不做 softmax、
+逐帧归一化、阶段标签或 token-level 可视化。列标题包含 replan 编号及真实环境步。
+
+输出目录：
+
+```text
+router_demo/
+├── gate_visualization/
+│   ├── timeline.png                 # 全部 replans，始终为两排
+│   ├── pages/page_000.png            # 默认每页 8 列，便于阅读长任务
+│   ├── frames/replan_0000.png        # 单次 replan 的观测和 gates
+│   ├── gate_rollout.mp4              # 每次 replan 一帧，默认 5 fps
+│   ├── replan_modality_history.npy   # [K,4]：DINO, CoTracker, SAM, Depth
+│   └── render_manifest.json         # 数值、环境步、顺序和颜色尺度说明
+├── dream_visualization/
+│   ├── frames/replan_0000.png        # Dream 预测单独成图，不混入 gate 图
+│   └── dream_predictions.mp4
+├── raw_predictions/replan_0000.pt    # RGB、完整 Dream tensors、16 gates 和 mapping
+├── gates/                           # 原有 [T,16]/[T,4] 和 replan history
+├── rollout/                         # 原有观测视频
+└── episode_manifest.json            # success、任务、初态、时间步等
+```
+
+MP4 是 replan 采样的展示视频，不表示 simulator 实时播放速度。Dream 图继续使用
+现有可视化方法：Depth 色图、Tracker 动态掩码、DINO 特征投影、SAM 特征聚类/PCA，
+不是把特征预测当作生成 RGB。所有原始预测 tensor 都保留，可以之后重绘。
+
+可选覆盖项：
+
+```bash
+GATE_VISUALIZATION.camera=both                # image / wrist_image / both
+GATE_VISUALIZATION.columns_per_page=8
+GATE_VISUALIZATION.column_width=320
+GATE_VISUALIZATION.image_height=224
+GATE_VISUALIZATION.fps=5
+GATE_VISUALIZATION.save_video=false
+GATE_VISUALIZATION.render_dream_images=false  # 跳过单独 Dream 渲染，仍保存原始预测
+```
+
+已经保存过带 routing 的 raw records，可以不加载模型和 LIBERO，直接重绘：
+
+```bash
+PYTHONPATH=src:. python Visualize/router_gate_visualization.py \
+  --raw-dir ./evaluate_results/router_demo/raw_predictions \
+  --output-dir ./evaluate_results/router_demo/gate_visualization \
+  --columns-per-page 8 --camera image --fps 5
+```
+
+每次新测评请选择新的 output_dir，避免不同 episode 的记录混合。

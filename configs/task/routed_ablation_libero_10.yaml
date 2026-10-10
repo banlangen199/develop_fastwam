@@ -14,4 +14,6 @@ model:
     mode: learned
     routing_mode: null
     gate_type: va  # Override with model.router.gate_type=static or da.
+    group_granularity: modality_horizon_view
+    lambda_budget: 0.0
     hard_prune_at_inference: false

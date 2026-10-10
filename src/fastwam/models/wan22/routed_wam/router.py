@@ -25,7 +25,10 @@ config:
     ``tests/test_routed_wam.py`` asserts equality against the original.
 
 ``learned``
-    One sigmoid gate per layer and Dream semantic group. ``gate_type=va`` uses
+    By default, PR #2's low-rank bilinear score combines the mean Action query
+    with each Dream key, plus layer and semantic-group biases. Each Dream token
+    receives its own sigmoid gate, trained with Action loss and a keep budget.
+    Explicit legacy ablations use one gate per semantic group: ``gate_type=va`` uses
     current observed Video keys and Action queries, without Dream features.
     ``gate_type=da`` uses predicted Dream keys and Action queries instead.
     ``gate_type=static`` learns input-independent logits for each layer/group.
@@ -56,18 +59,7 @@ from fastwam.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 ROUTER_MODES = ("none", "threshold", "learned")
-GATE_TYPES = ("va", "da", "static")
-
-#: How Dream tokens are bucketed for the budget bias, logging and analysis.
-#: The `_camera` variants split each block into its primary and wrist halves,
-#: which is what the stage-dependent-perception study needs.
-GROUP_GRANULARITIES = (
-    "none",
-    "modality",
-    "modality_horizon",
-    "modality_camera",
-    "modality_horizon_camera",
-)
+GATE_TYPES = ("bilinear", "va", "da", "static")
 
 
 @dataclass(frozen=True)
@@ -85,15 +77,15 @@ class RouterConfig:
     # --- threshold mode ---
     alpha: float = 1.0
     # --- learned mode ---
-    gate_type: str = "va"
+    gate_type: str = "bilinear"
     rank: int = 64
     temperature: float = 1.0
     bias_init: float = 4.0
     group_granularity: str = "modality_horizon"
     # --- shared ---
     min_keep_tokens: int = 0
-    target_keep_ratio: float = 0.25  # Compatibility only; no budget objective.
-    lambda_budget: float = 0.0  # Compatibility only; learned routing requires zero.
+    target_keep_ratio: float = 0.25
+    lambda_budget: float = 0.0
     gate_threshold: float = 1.0e-3
     hard_prune_at_inference: bool = True
     warmup_ratio: float = 0.1
@@ -128,7 +120,7 @@ class RouterConfig:
             )
         if cfg.lambda_budget < 0:
             raise ValueError(f"router.lambda_budget must be >= 0, got {cfg.lambda_budget}.")
-        if cfg.mode == "learned" and cfg.lambda_budget != 0:
+        if cfg.mode == "learned" and cfg.gate_type != "bilinear" and cfg.lambda_budget != 0:
             raise ValueError("Learned group routing uses Action loss only; lambda_budget must be 0.")
         if not 0.0 <= cfg.warmup_ratio <= 1.0:
             raise ValueError(f"router.warmup_ratio must be in [0,1], got {cfg.warmup_ratio}.")
@@ -148,7 +140,10 @@ class RouterConfig:
         return self.mode != "none"
 
 
-GROUP_GRANULARITIES = ("none", "modality", "modality_horizon", "modality_horizon_view")
+GROUP_GRANULARITIES = (
+    "none", "modality", "modality_horizon", "modality_camera",
+    "modality_horizon_camera", "modality_horizon_view",
+)
 
 
 def build_group_ids(
@@ -157,7 +152,7 @@ def build_group_ids(
     num_future_offsets: int,
     tokens_per_modality: dict[str, int],
     granularity: str,
-    camera_token_split: Optional[tuple[int, int]] = None,
+    camera_token_split: Optional[tuple[int, int] | list[int]] = None,
 ) -> tuple[torch.Tensor, list[str]]:
     """Map each Dream token to an interpretable group id.
 
@@ -180,6 +175,19 @@ def build_group_ids(
         raise ValueError(
             f"granularity must be one of {GROUP_GRANULARITIES}, got {granularity!r}."
         )
+    if granularity == "modality_horizon_view":
+        if (camera_token_split is None or len(camera_token_split) != 2
+                or any(int(n) <= 0 for n in camera_token_split)):
+            raise ValueError("modality_horizon_view requires camera_token_split=[main_tokens, wrist_tokens].")
+        ids, names = [], []
+        for modality in modalities:
+            if sum(camera_token_split) != int(tokens_per_modality[modality]):
+                raise ValueError(f"camera_token_split does not match {modality} token count.")
+            for offset_index in range(num_future_offsets):
+                for view, count in zip(("main", "wrist"), camera_token_split):
+                    ids.extend([len(names)] * int(count))
+                    names.append(f"{modality}@t{offset_index}@{view}")
+        return torch.tensor(ids, dtype=torch.long), names
     with_camera = granularity.endswith("_camera")
     with_horizon = "horizon" in granularity
     if with_camera and camera_token_split is None:
@@ -187,6 +195,9 @@ def build_group_ids(
             f"granularity={granularity!r} needs dream_query.camera_token_split; "
             "without it the primary and wrist tokens are indistinguishable."
         )
+
+    if with_camera and (len(camera_token_split) != 2 or any(int(n) <= 0 for n in camera_token_split)):
+        raise ValueError("camera_token_split requires two positive token counts.")
 
     cameras = ["primary", "wrist"] if with_camera else [None]
 
@@ -271,12 +282,13 @@ class ImaginationRouter(nn.Module):
         self.register_buffer("group_token_counts", counts, persistent=False)
         self.group_mapping = []
         for index, name in enumerate(self.group_names):
-            parts = name.split("@")
+            base_name, _, camera = name.partition("/")
+            parts = base_name.split("@")
             horizon = int(parts[1][1:]) if len(parts) > 1 else None
             positions = (group_ids == index).nonzero().flatten()
             self.group_mapping.append(dict(
                 group_id=index, name=name, modality=parts[0],
-                horizon_index=horizon, view=parts[2] if len(parts) > 2 else None,
+                horizon_index=horizon, view=camera or (parts[2] if len(parts) > 2 else None),
                 future_offset=(int(future_offsets[horizon]) if future_offsets is not None
                                and horizon is not None else horizon),
                 token_start=int(positions[0]), token_stop=int(positions[-1]) + 1,
@@ -298,9 +310,25 @@ class ImaginationRouter(nn.Module):
         self.dream_proj = None
         self.gate_proj = None
         self.register_parameter("static_logits", None)
-        if config.mode == "learned" and config.lambda_budget != 0:
+        self.query_proj = None
+        self.key_proj = None
+        self.register_parameter("layer_bias", None)
+        self.register_parameter("group_bias", None)
+        if config.mode == "learned" and config.gate_type != "bilinear" and config.lambda_budget != 0:
             raise ValueError("Learned group routing uses Action loss only; lambda_budget must be 0.")
-        if config.mode == "learned" and config.gate_type == "static":
+        if config.mode == "learned" and config.gate_type == "bilinear":
+            rank = int(config.rank)
+            self.query_proj = nn.ModuleList(
+                [nn.Linear(self.inner_dim, rank, bias=False) for _ in range(self.num_layers)]
+            )
+            self.key_proj = nn.ModuleList(
+                [nn.Linear(self.inner_dim, rank, bias=False) for _ in range(self.num_layers)]
+            )
+            self.layer_bias = nn.Parameter(torch.full((self.num_layers,), float(config.bias_init)))
+            self.group_bias = nn.Parameter(torch.zeros(self.num_layers, len(self.group_names)))
+            for module in list(self.query_proj) + list(self.key_proj):
+                nn.init.normal_(module.weight, std=1.0e-3)
+        elif config.mode == "learned" and config.gate_type == "static":
             self.static_logits = nn.Parameter(torch.full(
                 (self.num_layers, len(self.group_names)), float(config.bias_init), dtype=torch.float32
             ))
@@ -367,6 +395,40 @@ class ImaginationRouter(nn.Module):
         self.last_statistics = []
 
     # ------------------------------------------------------------------ gates
+    def _learned_gate(
+        self,
+        *,
+        layer_idx: int,
+        q_action: torch.Tensor,
+        k_dream: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a gate in (0, 1] of shape [B, Sd]."""
+        rank = int(self.config.rank)
+        # Mean over action queries: the routing decision is per (sample, layer),
+        # not per action step -- the whole chunk is denoised jointly and a
+        # per-step decision cannot be realised by a single key mask anyway.
+        query_summary = q_action.mean(dim=1)
+        q = self.query_proj[layer_idx](query_summary.to(self.query_proj[layer_idx].weight.dtype))
+        k = self.key_proj[layer_idx](k_dream.to(self.key_proj[layer_idx].weight.dtype))
+        logits = torch.einsum("br,bsr->bs", q, k) * (rank ** -0.5)
+        logits = logits + self.layer_bias[layer_idx]
+        group_bias = self.group_bias[layer_idx].index_select(
+            0, self.group_ids.to(device=logits.device)
+        )
+        logits = logits + group_bias.unsqueeze(0)
+        return torch.sigmoid(logits / float(self.config.temperature))
+
+    def budget_loss(self, gates: list[torch.Tensor]) -> torch.Tensor:
+        """Push the average gate towards the configured keep ratio."""
+        if not gates or self.config.lambda_budget <= 0.0 or self.config.mode != "learned":
+            device = gates[0].device if gates else torch.device("cpu")
+            return torch.zeros((), device=device)
+        mean_gate = torch.stack([g.mean() for g in gates]).mean()
+        target = torch.as_tensor(
+            float(self.config.target_keep_ratio), device=mean_gate.device, dtype=mean_gate.dtype
+        )
+        return float(self.config.lambda_budget) * (mean_gate - target).pow(2)
+
     def learned_group_gate(
         self,
         *,
@@ -471,15 +533,15 @@ class ImaginationRouter(nn.Module):
         dream_slice: Optional[slice] = None,
         n_valid: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """Compute one layer's gate; Dream K is a generator input only for DA.
+        """Compute a PR #2 token gate or an explicitly selected legacy group gate.
 
         Returns a dict with:
             gate: [B, Sd] multiplicative gate in [0, 1] (differentiable in
                 ``learned`` mode, a hard 0/1 tensor in ``threshold`` mode).
             keep: [B, Sd] boolean mask used for hard pruning / statistics.
             score: [B, Sd] the quantity the decision was based on.
-            group_gate/group_keep/group_score: [B, Ng] in learned mode. group_gate
-                is the gate actually used, after warmup and optional hard pruning.
+            group_gate/group_keep/group_score: [B, Ng] for legacy group priors;
+                absent for the bilinear token router.
         """
         batch_size = int(q_action.shape[0])
         num_dream = self.num_dream_tokens
@@ -488,7 +550,7 @@ class ImaginationRouter(nn.Module):
         device = q_action.device
 
         if layer_idx not in self.active_layers or self.config.mode == "none":
-            if self.config.mode == "learned":
+            if self.config.mode == "learned" and self.config.gate_type != "bilinear":
                 group = torch.ones((batch_size, len(self.group_names)), device=device)
                 return self._group_result(group, group.bool(), group)
             gate = torch.ones((batch_size, num_dream), device=device, dtype=torch.float32)
@@ -496,7 +558,7 @@ class ImaginationRouter(nn.Module):
 
         if self.config.debug_force_gate is not None:
             value = float(self.config.debug_force_gate)
-            if self.config.mode == "learned":
+            if self.config.mode == "learned" and self.config.gate_type != "bilinear":
                 group = torch.full((batch_size, len(self.group_names)), value, device=device)
                 return self._group_result(group, group > self.config.gate_threshold, group)
             gate = torch.full((batch_size, num_dream), value, device=device, dtype=torch.float32)
@@ -513,6 +575,20 @@ class ImaginationRouter(nn.Module):
             keep = score >= float(self.config.alpha)
             keep = self._apply_min_keep(keep, score)
             gate = keep.to(dtype=torch.float32)
+        elif self.config.gate_type == "bilinear":
+            if k_dream is None:
+                raise ValueError("Bilinear routing requires k_dream.")
+            with torch.autocast(device_type=q_action.device.type, enabled=False):
+                score = self._learned_gate(
+                    layer_idx=layer_idx, q_action=q_action, k_dream=k_dream
+                ).float()
+            strength = self.current_strength()
+            if strength < 1.0:
+                score = score * strength + (1.0 - strength)
+            keep = self._apply_min_keep(score > float(self.config.gate_threshold), score.detach())
+            gate = score
+            if self.config.hard_prune_at_inference and not self.training:
+                gate = gate * keep.to(dtype=gate.dtype)
         else:
             group_score = self.learned_group_gate(
                 layer_idx=layer_idx, q_action=q_action, k_video_current=k_video_current, k_dream=k_dream
